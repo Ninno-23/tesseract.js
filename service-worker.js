@@ -1,4 +1,4 @@
-const CACHE_NAME = "studyvault-v11-shell";
+const CACHE_NAME = "studyvault-v12-shell";
 const SHELL = [
   "./",
   "./index.html",
@@ -8,7 +8,7 @@ const SHELL = [
   "./manifest.json",
   "./icon.svg"
 ];
-const REMOTE_CACHE = "studyvault-v11-runtime";
+const REMOTE_CACHE = "studyvault-v12-runtime";
 const ALLOWED_REMOTE = [
   "cdnjs.cloudflare.com",
   "cdn.jsdelivr.net",
