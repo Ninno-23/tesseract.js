@@ -2,15 +2,18 @@
 (() => {
 "use strict";
 
-const APP_VERSION = 9;
+const APP_VERSION = 11;
 const DB_NAME = "studyvault-v5";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const DOC_STORE = "documents";
 const META_STORE = "meta";
 const SETTINGS_KEY = "settings";
 const CDN_PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
 const CDN_PDF_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 const CDN_TESSERACT = "https://cdn.jsdelivr.net/npm/tesseract.js@7/dist/tesseract.min.js";
+const LOCAL_PDFJS = "./vendor/pdfjs/pdf.min.js";
+const LOCAL_PDF_WORKER = "./vendor/pdfjs/pdf.worker.min.js";
+const AI_WORKER_URL = "./ai-worker.js";
 
 let pdfEnginePromise = null;
 let tesseractPromise = null;
@@ -30,7 +33,7 @@ const debounce = (fn, ms=350) => { let t; return (...args) => { clearTimeout(t);
 const STOP = new Set(("a an and are as at be because been before being between but by can could did do does for from had has have he her here hers him his how i if in into is it its itself just may me might more most my no not of on one or our ours out over same she should so some than that the their theirs them themselves then there these they this those through to too under up us was we were what when where which while who whom why will with would you your yours about after again against all also among another any anything around become below both during each either enough even every example few first following further given going having however important later least little many maybe much must never often other otherwise perhaps rather since such very want without within yet" ).split(/\s+/));
 
 let state = {
-  settings: { theme:"dark", pinHash:"", pinSalt:"", pinIterations:120000, ai:{enabled:false,model:"onnx-community/Qwen2.5-0.5B-Instruct"}, learner:{version:1,sessions:0,streak:0,recentAccuracy:null,concepts:{}} },
+  settings: { theme:"dark", pinHash:"", pinSalt:"", pinIterations:120000, ai:{enabled:false,model:"onnx-community/Qwen3-0.6B-ONNX"}, learner:{version:1,sessions:0,streak:0,recentAccuracy:null,concepts:{}} },
   documents: [],
   activeDocId: null
 };
@@ -59,34 +62,52 @@ function activateSection(id){
 function activeDoc(){return state.documents.find(d=>d.id===state.activeDocId)||null;}
 
 function setEngineStatus(text){const el=$("#engineStatus");if(el)el.textContent=`PDF engine: ${text}`;}
-function loadPdfEngine(){
-  if(window.pdfjsLib){
-    window.pdfjsLib.GlobalWorkerOptions.workerSrc = CDN_PDF_WORKER;
-    setEngineStatus("ready");
-    return Promise.resolve(true);
-  }
-  if(pdfEnginePromise)return pdfEnginePromise;
-  setEngineStatus("loading…");
-  pdfEnginePromise = new Promise(resolve=>{
+function loadScript(src, timeoutMs=12000){
+  return new Promise(resolve=>{
     const script=document.createElement("script");
-    script.src=CDN_PDFJS;
+    script.src=src;
     script.async=true;
-    let done=false;
-    const finish=ok=>{
-      if(done)return;
-      done=true;
-      clearTimeout(timer);
-      if(ok&&window.pdfjsLib){window.pdfjsLib.GlobalWorkerOptions.workerSrc=CDN_PDF_WORKER;setEngineStatus("ready");resolve(true);}
-      else {setEngineStatus("unavailable — connect to the internet to process PDFs");resolve(false);}
-    };
+    let finished=false;
+    const timer=setTimeout(()=>finish(false),timeoutMs);
+    function finish(ok){
+      if(finished)return; finished=true; clearTimeout(timer); resolve(ok);
+      if(!ok)script.remove();
+    }
     script.onload=()=>finish(true);
     script.onerror=()=>finish(false);
     document.head.appendChild(script);
-    const timer=setTimeout(()=>finish(false),10000);
   });
+}
+async function loadPdfEngine(){
+  if(window.pdfjsLib){
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc=LOCAL_PDF_WORKER;
+    setEngineStatus("ready • offline-capable");
+    return true;
+  }
+  if(pdfEnginePromise)return pdfEnginePromise;
+  setEngineStatus(navigator.onLine?"loading…":"offline — PDF engine not cached");
+  pdfEnginePromise=(async()=>{
+    // Prefer a bundled copy. If it is not present, fall back to the pinned CDN copy.
+    if(await loadScript(LOCAL_PDFJS,2500) && window.pdfjsLib){
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc=LOCAL_PDF_WORKER;
+      setEngineStatus("ready • bundled");
+      return true;
+    }
+    if(!navigator.onLine){
+      setEngineStatus("offline — PDF engine not cached");
+      return false;
+    }
+    const ok=await loadScript(CDN_PDFJS,12000);
+    if(ok&&window.pdfjsLib){
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc=CDN_PDF_WORKER;
+      setEngineStatus("ready • cached after first use");
+      return true;
+    }
+    setEngineStatus("unavailable — reconnect and try again");
+    return false;
+  })().finally(()=>{pdfEnginePromise=null;});
   return pdfEnginePromise;
 }
-
 
 function setOcrStatus(text){const el=$("#ocrStatus");if(el)el.textContent=`OCR: ${text}`;}
 function loadTesseract(){
@@ -517,22 +538,22 @@ function deterministicShuffle(arr,seedText=""){
   for(let i=a.length-1;i>0;i--){seed=(Math.imul(seed,1664525)+1013904223)>>>0;const j=seed%(i+1);[a[i],a[j]]=[a[j],a[i]];}return a;
 }
 
-function quizItem(doc,type,question,context,correct,options,page){
-  const unique=[...new Set(options.filter(Boolean))];if(!unique.includes(correct))unique.unshift(correct);const opts=deterministicShuffle(unique.slice(0,4),question+correct);return opts.length>=2?{id:stableId("q",`${doc.id}|${type}|${question}|${correct}`),type,question,context,options:opts,correctIndex:opts.indexOf(correct),correct,page}:null;
+function quizItem(doc,type,question,context,correct,options,page,term=""){
+  const unique=[...new Set(options.filter(Boolean))];if(!unique.includes(correct))unique.unshift(correct);const opts=deterministicShuffle(unique.slice(0,4),question+correct);return opts.length>=2?{id:stableId("q",`${doc.id}|${type}|${question}|${correct}`),type,question,context,options:opts,correctIndex:opts.indexOf(correct),correct,page,term}:null;
 }
 
 function makeQuiz(doc){
   const r=doc.reviewerData||buildReviewer(doc),terms=r.terms||[],quiz=[],seen=new Set();const add=q=>{if(q&&!seen.has(q.id)){seen.add(q.id);quiz.push(q);}};
   for(const d of (r.definitions||[])){
     const wrong=deterministicShuffle(terms.filter(t=>t.toLowerCase()!==d.term.toLowerCase()),d.term).slice(0,3);
-    add(quizItem(doc,"definition",`Which concept is best described by the definition below?`,d.definition,d.term,[d.term,...wrong],d.page));
+    add(quizItem(doc,"definition",`Which concept is best described by the definition below?`,d.definition,d.term,[d.term,...wrong],d.page,d.term));
     if(quiz.length>=8)break;
   }
   for(const term of terms){
     if(quiz.length>=14)break;
     const u=sentenceUnits(doc).find(x=>x.text.toLowerCase().includes(term.toLowerCase()));if(!u)continue;
     const wrong=deterministicShuffle(terms.filter(t=>t!==term),term).slice(0,3);
-    add(quizItem(doc,"concept","Which term is most directly supported by this source statement?",u.text,term,[term,...wrong],u.page));
+    add(quizItem(doc,"concept","Which term is most directly supported by this source statement?",u.text,term,[term,...wrong],u.page,term));
   }
   for(const p of (r.keyPoints||[])){
     if(quiz.length>=20)break;
@@ -587,7 +608,77 @@ function regenerateDoc(doc,resetProgress=false){
   doc.reviewerVersion=REVIEW_ENGINE_VERSION;
 }
 
-function scheduleAIForDoc(doc){if(!state.settings.ai?.enabled||!window.StudyVaultAI)return;setTimeout(async()=>{try{const ai=await window.StudyVaultAI.enhanceDocument(doc,learnerProfile(),{progress:m=>{const el=$("#aiStatus");if(el)el.textContent=m.message||"Local AI working…";}});doc.ai={...(doc.ai||{}),...ai};if(ai.reviewer&&doc.reviewerData)doc.reviewerData.aiReviewer=ai.reviewer;await saveDoc(doc);renderAll();}catch(e){console.warn("AI enhancement skipped",e);}},80);}
+
+let aiWorker=null, aiSeq=0, aiCurrent=null;
+function aiEnsureWorker(){
+  if(aiWorker)return aiWorker;
+  aiWorker=new Worker(AI_WORKER_URL,{type:"module"});
+  aiWorker.onmessage=e=>{
+    const m=e.data||{};
+    if(m.type==="status"||m.type==="progress"){
+      const el=$("#aiStatus");if(el)el.textContent=m.message||"Local AI working…";
+      return;
+    }
+    if(m.type==="ready"){
+      const el=$("#aiStatus");if(el)el.textContent=`Local AI ready • ${m.device||"local"}`;
+      return;
+    }
+    if(m.type==="token" && aiCurrent?.requestId===m.requestId){
+      aiCurrent.text=(aiCurrent.text||"")+String(m.text||"");
+      const box=aiCurrent.mode==="ask"?$("#aiAnswer"):$("#aiReviewer");if(box)box.textContent=aiCurrent.text;
+      return;
+    }
+    if(m.type==="done"){
+      const pending=aiCurrent;if(!pending||pending.requestId!==m.requestId)return;
+      aiCurrent=null;pending.resolve(m);return;
+    }
+    if(m.type==="error"){
+      const pending=aiCurrent;if(!pending||pending.requestId!==m.requestId)return;
+      aiCurrent=null;pending.reject(new Error(m.message||"Local AI failed."));return;
+    }
+  };
+  aiWorker.onerror=e=>{if(aiCurrent){aiCurrent.reject(new Error("Local AI worker stopped unexpectedly."));aiCurrent=null;}const s=$("#aiStatus");if(s)s.textContent="Local AI worker unavailable.";};
+  return aiWorker;
+}
+function aiRequest(task,payload){
+  const worker=aiEnsureWorker(),requestId=++aiSeq;
+  return new Promise((resolve,reject)=>{aiCurrent={requestId,resolve,reject,mode:task==="ask"?"ask":"reviewer",text:""};worker.postMessage({type:"task",task,requestId,...payload});});
+}
+function aiCancel(){if(aiWorker){try{aiWorker.postMessage({type:"cancel"});}catch{};try{aiWorker.terminate();}catch{};aiWorker=null;}if(aiCurrent){aiCurrent.reject(new Error("AI task cancelled."));aiCurrent=null;}const s=$("#aiStatus");if(s)s.textContent="AI stopped. Your saved reviewer is safe.";const b=$("#aiEnhance");if(b)b.disabled=false;}
+function learnerDigestForAI(){const p=learnerProfile();return JSON.stringify({level:p.level||"beginner",sessions:p.sessions||0,recentAccuracy:p.recentAccuracy,weak:weakConcepts(8),concepts:Object.values(p.concepts||{}).slice(0,20).map(x=>({label:x.label,mastery:x.mastery,attempts:x.attempts,streak:x.streak}))});}
+function pageRelevance(page, queryTerms, terms){
+  const text=normalize(page?.text||"").toLowerCase();
+  if(!text)return 0;
+  let score=0;
+  for(const q of queryTerms){if(q.length>=3&&text.includes(q))score+=3;}
+  for(const t of terms.slice(0,30)){const tt=String(t).toLowerCase();if(tt.length>=4&&text.includes(tt))score+=0.35;}
+  if(page?.source==="photo"||page?.source==="ocr")score+=0.2;
+  return score;
+}
+function aiSource(d, query=""){
+  const pages=(d.pageTexts||[]).filter(p=>normalize(p.text||""));
+  if(!pages.length)return normalize(d.rawText||"").slice(0,26000);
+  const queryTerms=tokenize(query).filter(x=>x.length>=3&&!STOP.has(x)).slice(0,12);
+  const scored=pages.map((p,i)=>({p,i,score:pageRelevance(p,queryTerms,d.terms||[])}));
+  const picks=new Set();
+  // Always sample the beginning/end and then fill with relevance + coverage.
+  [0,1,2,pages.length-3,pages.length-2,pages.length-1].forEach(i=>{if(i>=0&&i<pages.length)picks.add(i);});
+  for(const item of scored.sort((a,b)=>b.score-a.score)){
+    if(picks.size>=14)break;
+    if(item.score>0)picks.add(item.i);
+  }
+  const step=Math.max(1,Math.floor(pages.length/10));
+  for(let i=step;i<pages.length&&picks.size<14;i+=step)picks.add(i);
+  const ordered=[...picks].sort((a,b)=>a-b).map(i=>{
+    const p=pages[i];
+    return `PAGE ${p.page}\n${normalize(p.text).slice(0,2600)}`;
+  });
+  return ordered.join("\n\n---\n\n").slice(0,26000);
+}
+function aiQuestionSource(d, question){return aiSource(d,question);}
+
+function scheduleAIForDoc(doc){return Promise.resolve(doc);}
+
 
 async function renderPdfPageForOcr(page,scale=1.55){
   const viewport=page.getViewport({scale});
@@ -640,21 +731,22 @@ function stripHtml(html){
 function safeNoteHtml(html){
   const box=document.createElement("div");box.innerHTML=String(html||"");
   const allowed=new Set(["P","DIV","BR","STRONG","B","EM","I","U","H2","H3","UL","OL","LI","BLOCKQUOTE","IMG","A","SPAN"]);
-  const safeImage=/^data:image\/(png|jpeg|webp|gif);base64,[a-z0-9+/=]+$/i;
-  const safeHref=/^(https?:|mailto:)/i;
+  const safeImage=/^data:image\/(?:png|jpeg|webp|gif);base64,[a-z0-9+/=]+$/i;
+  const safeHref=/^(?:https?:\/\/|mailto:)[^\s]+$/i;
   box.querySelectorAll("*").forEach(el=>{
     if(!allowed.has(el.tagName)){el.replaceWith(...el.childNodes);return;}
     [...el.attributes].forEach(attr=>{
       const n=attr.name.toLowerCase(),v=attr.value||"";
-      if(n.startsWith("on")||n==="style"||n==="srcdoc"||n==="formaction"||n==="xlink:href"){el.removeAttribute(attr.name);return;}
+      if(n.startsWith("on")||n==="style"||n==="srcdoc"||n==="formaction"||n==="xlink:href"||n==="xmlns"||n==="is"||n==="slot"||n==="part"){el.removeAttribute(attr.name);return;}
       if(el.tagName==="IMG"&&n==="src"&&!safeImage.test(v)){el.removeAttribute(attr.name);return;}
       if(el.tagName==="A"&&n==="href"&&!safeHref.test(v)){el.removeAttribute(attr.name);return;}
-      if(el.tagName==="A"&&n==="target")el.setAttribute("rel","noopener noreferrer");
+      if(el.tagName==="A"&&n==="target"){el.setAttribute("rel","noopener noreferrer");}
       if(!["src","alt","href","target","rel"].includes(n))el.removeAttribute(attr.name);
     });
   });
   return box.innerHTML||"<p></p>";
 }
+
 function migrateCardStats(d){
   const out=typeof d.cardStats==="object"&&d.cardStats?{...d.cardStats}:{};
   for(const c of d.flashcards||[]){
@@ -691,7 +783,7 @@ function renderLibrary(){
   box.querySelectorAll('[data-open]').forEach(b=>b.onclick=async()=>{state.activeDocId=b.dataset.open;await saveMeta();renderAll();activateSection('dashboard');});
   box.querySelectorAll('[data-delete]').forEach(b=>b.onclick=async()=>{const d=state.documents.find(x=>x.id===b.dataset.delete);if(!d)return;if(!confirm(`Delete ${d.fileName}?`))return;await dbDelete(DOC_STORE,d.id);state.documents=state.documents.filter(x=>x.id!==d.id);state.activeDocId=state.documents[0]?.id||null;await saveMeta();renderAll();toast('Document deleted.','success');});
 }
-function renderStats(){const docs=state.documents;$("#stats").classList.toggle('hidden',!docs.length);$("#statDocs").textContent=docs.length;$("#statPages").textContent=docs.reduce((a,d)=>a+(d.pageCount||0),0).toLocaleString();$("#statPhotos").textContent=docs.reduce((a,d)=>a+(d.media?.length||0),0).toLocaleString();$("#statWords").textContent=docs.reduce((a,d)=>a+wordCount(d.rawText||''),0).toLocaleString();$("#statTerms").textContent=activeDoc()?.terms.length||0;$("#statFlash").textContent=activeDoc()?.flashcards.length||0;$("#statQuiz").textContent=activeDoc()?.quiz.length||0;$("#navFlash").textContent=activeDoc()?.flashcards.length||0;$("#navQuiz").textContent=activeDoc()?.quiz.length||0;}
+function renderStats(){const docs=state.documents;$("#stats").classList.toggle('hidden',!docs.length);$("#statDocs").textContent=docs.length;if($("#heroDocCount"))$("#heroDocCount").textContent=docs.length;$("#statPages").textContent=docs.reduce((a,d)=>a+(d.pageCount||0),0).toLocaleString();$("#statPhotos").textContent=docs.reduce((a,d)=>a+(d.media?.length||0),0).toLocaleString();$("#statWords").textContent=docs.reduce((a,d)=>a+wordCount(d.rawText||''),0).toLocaleString();$("#statTerms").textContent=activeDoc()?.terms.length||0;$("#statFlash").textContent=activeDoc()?.flashcards.length||0;$("#statQuiz").textContent=activeDoc()?.quiz.length||0;$("#navFlash").textContent=activeDoc()?.flashcards.length||0;$("#navQuiz").textContent=activeDoc()?.quiz.length||0;}
 function renderActivePanel(){const d=activeDoc(),box=$("#activeDocPanel");if(!d){box.innerHTML='<div class="empty">Add a PDF or photo to start studying.</div>';return;}const known=d.knownCardIds.length,total=d.flashcards.length,progress=total?Math.round(known/total*100):0;box.innerHTML=`<div class="doc" style="margin-bottom:12px"><div class="doc-icon">${d.sourceType==='image'?'🖼':'📘'}</div><div class="doc-main"><div class="doc-name">${esc(d.fileName)}</div><div class="doc-meta">${d.sourceType==='image'?'Photo study':'PDF'} • ${d.pageCount||1} page${(d.pageCount||1)===1?'':'s'} • ${d.media?.length||0} photo(s) • ${wordCount(d.rawText||'').toLocaleString()} words</div></div></div><div class="source-pill">${d.sourceType==='image'?'OCR + Visual':'PDF text + page structure'}</div><p class="muted" style="line-height:1.65;margin-top:12px">${esc(d.reviewerData?.overview||'')}</p><div style="margin-top:14px"><div style="display:flex;justify-content:space-between;gap:10px;font-size:.75rem;color:var(--muted)"><span>Flashcard progress</span><span>${known}/${total} (${progress}%)</span></div><div class="progress-track" style="margin-top:6px"><div class="progress-bar" style="width:${progress}%"></div></div></div><div class="row" style="margin-top:14px"><button class="btn primary small" data-go="reviewer">Reviewer</button><button class="btn secondary small" data-go="flashcards">Flashcards</button><button class="btn secondary small" data-go="quiz">Quiz</button><button id="regenDocBtn" class="btn warning small">Regenerate</button></div>`;box.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>activateSection(b.dataset.go));$("#regenDocBtn").onclick=async()=>{regenerateDoc(d,true);await saveDoc(d);renderAll();toast('Reviewer, flashcards, and quiz regenerated.','success');};}
 function renderTerms(){const c=$("#reviewerTerms"),terms=activeDoc()?.terms||[];c.innerHTML=terms.length?terms.map(t=>`<span class="term">${esc(t)}</span>`).join(''):'<div class="empty">No terms detected.</div>';}
 function renderReviewer(){
@@ -800,16 +892,25 @@ function insertAtCursor(html){
 }
 function scheduleNoteSave(){
   const d=activeDoc();if(!d)return;
-  const token=++noteSaveToken;$("#noteSaveStatus").textContent='Saving…';
+  const docId=d.id;
+  const title=($("#notesTitle")?.value||"Study Notes").trim()||"Study Notes";
+  const htmlSnapshot=safeNoteHtml($("#notesEditor")?.innerHTML||"<p></p>");
+  const token=++noteSaveToken;
+  $("#noteSaveStatus").textContent="Saving…";
   setTimeout(async()=>{
     if(token!==noteSaveToken)return;
-    const doc=state.documents.find(x=>x.id===d.id);if(!doc)return;
-    doc.notesTitle=$("#notesTitle").value.trim()||'Study Notes';
-    doc.notesHtml=safeNoteHtml($("#notesEditor").innerHTML||'<p></p>');
-    doc.notes=stripHtml(doc.notesHtml);doc.notesUpdatedAt=now();await saveDoc(doc);
-    if(activeDoc()?.id===doc.id){$("#noteSaveStatus").textContent='Saved';$("#noteWordCount").textContent=`${wordCount(doc.notes)} words`;$("#noteUpdatedAt").textContent=`Saved ${new Date(doc.notesUpdatedAt).toLocaleTimeString()}`;}
-  },500);
+    const doc=state.documents.find(x=>x.id===docId);if(!doc)return;
+    try{
+      doc.notesTitle=title;
+      doc.notesHtml=htmlSnapshot;
+      doc.notes=stripHtml(htmlSnapshot);
+      doc.notesUpdatedAt=now();
+      await saveDoc(doc);
+      if(activeDoc()?.id===docId){$("#noteSaveStatus").textContent="Saved";$("#noteWordCount").textContent=`${wordCount(doc.notes)} words`;$("#noteUpdatedAt").textContent=`Saved ${new Date(doc.notesUpdatedAt).toLocaleTimeString()}`;}
+    }catch(e){if(activeDoc()?.id===docId)$("#noteSaveStatus").textContent="Save failed";toast(e.message||"Could not save notes.","error");}
+  },420);
 }
+
 function exportNotes(){
   const d=activeDoc();if(!d)return toast('Select a document first.','error');
   const txt=`${d.notesTitle}\n\n${d.notes}\n`;
@@ -822,10 +923,10 @@ function downloadReviewer(){const d=activeDoc();if(!d)return toast('Select a doc
 
 async function submitQuiz(){
   const d=activeDoc();if(!d)return toast('Select a document first.','error');
-  let score=0;
-  d.quiz.forEach((q,i)=>{const item=document.querySelector(`[data-q="${i}"]`),picked=document.querySelector(`input[name="q-${i}"]:checked`);if(!item)return;item.classList.remove('correct','wrong');const ok=!!picked&&Number(picked.value)===q.correctIndex;const concept=(d.terms||[]).find(t=>(q.context||q.question||'').toLowerCase().includes(String(t).toLowerCase()));if(concept)adaptConcept(concept,ok);if(ok){score++;item.classList.add('correct')}else item.classList.add('wrong');});
-  d.quizScore=score;d.quizHistory=d.quizHistory||[];const percent=d.quiz.length?Math.round(score/d.quiz.length*100):0;recordStudyResult([],percent/100);await saveMeta();d.quizHistory.push({at:now(),score,total:d.quiz.length,percent});await saveDoc(d);
-  $("#quizResult").classList.remove('hidden');$("#quizResult").innerHTML=`<div class="score">${percent}%</div><p>You scored <strong>${score}/${d.quiz.length}</strong>.</p><p class="muted">Use the page numbers on missed questions to review the exact material before trying a new quiz.</p>`;renderQuizHistory(d);toast(`Quiz completed: ${score}/${d.quiz.length}.`,'success');
+  let score=0;const concepts=[];
+  d.quiz.forEach((q,i)=>{const item=document.querySelector(`[data-q="${i}"]`),picked=document.querySelector(`input[name="q-${i}"]:checked`);if(!item)return;item.classList.remove('correct','wrong');const ok=!!picked&&Number(picked.value)===q.correctIndex;const concept=q.term||((d.terms||[]).find(t=>(q.context||q.question||'').toLowerCase().includes(String(t).toLowerCase())));if(concept){adaptConcept(concept,ok);concepts.push(concept);}if(ok){score++;item.classList.add('correct')}else item.classList.add('wrong');});
+  d.quizScore=score;d.quizHistory=d.quizHistory||[];const percent=d.quiz.length?Math.round(score/d.quiz.length*100):0;recordStudyResult(concepts,percent/100);await saveMeta();d.quizHistory.push({at:now(),score,total:d.quiz.length,percent,concepts:[...new Set(concepts)]});await saveDoc(d);
+  $("#quizResult").classList.remove('hidden');$("#quizResult").innerHTML=`<div class="score">${percent}%</div><p>You scored <strong>${score}/${d.quiz.length}</strong>.</p><p class="muted">Weak concepts are now prioritized in future flashcard sessions.</p>`;renderQuizHistory(d);renderAI();toast(`Quiz completed: ${score}/${d.quiz.length}.`,'success');
 }
 async function newQuiz(){const d=activeDoc();if(!d)return toast('Select a document first.','error');d.quiz=makeQuiz(d);d.quizScore=null;await saveDoc(d);renderQuiz();renderStats();toast('New quiz generated.','success');}
 function nextSmartIndex(d,current,delta){
@@ -838,61 +939,53 @@ function nextSmartIndex(d,current,delta){
 async function moveFlash(delta){const d=activeDoc();if(!d?.flashcards.length)return;d.currentCard=nextSmartIndex(d,d.currentCard,delta);await saveDoc(d);renderFlash();renderDashboard();}
 async function markKnown(known){
   const d=activeDoc();if(!d?.flashcards.length)return;const card=d.flashcards[d.currentCard],id=card.id;
-  d.cardStats=d.cardStats||{};const prev=d.cardStats[id]||{attempts:0,correct:0,streak:0,ease:2.5,dueAt:0};const next={...prev,attempts:prev.attempts+1,lastSeen:Date.now()};
-  if(known){next.correct=prev.correct+1;next.streak=prev.streak+1;next.ease=Math.min(3.2,prev.ease+.12);next.dueAt=Date.now()+Math.min(1000*60*60*24*21,1000*60*10*Math.pow(Math.max(1.4,next.ease),Math.min(6,next.streak)));if(!d.knownCardIds.includes(id))d.knownCardIds.push(id);}else{next.streak=0;next.ease=Math.max(1.3,prev.ease-.2);next.dueAt=Date.now()+1000*60*2;d.knownCardIds=d.knownCardIds.filter(x=>x!==id);}
+  d.cardStats=d.cardStats||{};const prev=d.cardStats[id]||{attempts:0,correct:0,streak:0,ease:2.5,interval:0,dueAt:0,lastSeen:0};const next={...prev,attempts:prev.attempts+1,lastSeen:Date.now()};
+  if(known){next.correct=prev.correct+1;next.streak=prev.streak+1;next.ease=Math.min(3.25,prev.ease+.10);next.interval=next.streak===1?1:next.streak===2?3:Math.max(5,Math.round((prev.interval||3)*next.ease));next.dueAt=Date.now()+Math.min(1000*60*60*24*365,next.interval*24*60*60*1000);if(!d.knownCardIds.includes(id))d.knownCardIds.push(id);}else{next.streak=0;next.ease=Math.max(1.3,prev.ease-.20);next.interval=0;next.dueAt=Date.now()+1000*60*5;d.knownCardIds=d.knownCardIds.filter(x=>x!==id);}
   d.cardStats[id]=next;adaptConcept(card.term||card.question,known);await saveDoc(d);await saveMeta();renderFlash();renderDashboard();renderAI();toast(known?"Marked known and scheduled for later review.":"Marked for review soon.",known?"success":"");}
 
 async function runLocalAIEnhancement(){
   const d=activeDoc();if(!d)return toast("Select a study material first.","error");
-  if(!window.StudyVaultAI)return toast("Local AI module is unavailable.","error");
-  const status=$("#aiStatus"),btn=$("#aiEnhance");
-  if(btn)btn.disabled=true;if(status)status.textContent="Starting local AI…";
+  const status=$("#aiStatus"),btn=$("#aiEnhance");if(btn)btn.disabled=true;if(status)status.textContent="Starting local AI…";
+  const reviewBox=$("#aiReviewer");if(reviewBox)reviewBox.textContent="AI is working locally. Tokens will appear here as they are generated…";
   try{
-    const learner=learnerProfile();
-    const ai=await window.StudyVaultAI.enhanceDocument(d,learner,{progress:m=>{if(status)status.textContent=m.message||"Local AI working…";}});
-    d.ai={...(d.ai||{}),...ai};
-    if(ai.reviewer)d.reviewerData.aiReviewer=ai.reviewer;
-    if(ai.cards?.length){
-      const existing=new Set(d.flashcards.map(c=>normalize(c.question).toLowerCase()));
-      const extra=ai.cards.map(c=>({...c,id:stableId("ai-fc",`${d.id}|${c.question}|${c.answer}`)})).filter(c=>!existing.has(normalize(c.question).toLowerCase()));
-      d.flashcards=[...d.flashcards,...extra].slice(0,80);
-    }
-    if(ai.quiz?.length){
-      const existing=new Set(d.quiz.map(q=>normalize(q.question).toLowerCase()));
-      const extra=ai.quiz.map(q=>({...q,id:stableId("ai-q",`${d.id}|${q.question}`)})).filter(q=>q.options?.length>=3&&!existing.has(normalize(q.question).toLowerCase()));
-      d.quiz=[...d.quiz,...extra].slice(0,32);
-    }
-    await saveDoc(d);await saveMeta();renderAll();
-    if(status)status.textContent=`Local AI ready • grounded ${ai.groundingScore}% • ${ai.device}`;
-    toast("Local AI study upgrade completed.","success");
-  }catch(e){console.error(e);if(status)status.textContent="AI unavailable — deterministic reviewer kept";toast(e.message||"Local AI failed. Your existing reviewer was preserved.","error");}
+    const result=await aiRequest("reviewer",{source:aiSource(d),profile:learnerDigestForAI(),terms:d.terms||[]});
+    const threshold=35;
+    if((result.groundingScore||0)<threshold)throw new Error("AI output did not meet the grounding threshold. The deterministic reviewer was kept.");
+    d.ai={...(d.ai||{}),enabled:true,generatedAt:now(),reviewer:result.text,groundingScore:result.groundingScore,device:result.device,model:result.model||state.settings.ai.model};
+    d.reviewerData=d.reviewerData||buildReviewer(d);d.reviewerData.aiReviewer=result.text;await saveDoc(d);state.settings.ai.enabled=true;await saveMeta();renderAll();if(status)status.textContent=`Local AI ready • grounded ${result.groundingScore}% • ${result.device}`;toast("Local AI reviewer completed.","success");
+  }catch(e){if(status)status.textContent=e.message==="AI task cancelled."?"AI stopped.":"AI unavailable — deterministic reviewer kept";if(e.message!=="AI task cancelled.")toast(e.message||"Local AI failed. Your source reviewer is still available.","error");}
   finally{if(btn)btn.disabled=false;}
 }
 async function enableLocalAI(){
-  if(!window.StudyVaultAI)return toast("Local AI module is missing.","error");
-  const status=$("#aiStatus");if(status)status.textContent="Preparing local AI…";
-  try{await window.StudyVaultAI.load(m=>{if(status)status.textContent=m.message||"Loading local AI…";});state.settings.ai.enabled=true;await saveMeta();renderAll();toast("Local AI enabled. First setup may download and cache a model.","success");}
-  catch(e){state.settings.ai.enabled=false;await saveMeta();if(status)status.textContent="Not available on this browser/device";toast(e.message||"Local AI could not start.","error");}
+  const status=$("#aiStatus");if(status)status.textContent="Loading the on-device model. The page will stay responsive while it downloads…";
+  try{const worker=aiEnsureWorker();state.settings.ai.enabled=true;await saveMeta();worker.postMessage({type:"load"});toast("Local AI load started. Keep the app open until the model finishes downloading.","success");}catch(e){state.settings.ai.enabled=false;await saveMeta();toast(e.message||"Local AI could not start.","error");}
 }
-async function disableLocalAI(){state.settings.ai.enabled=false;await saveMeta();renderAll();toast("Local AI disabled. The rule-based reviewer still works.");}
+async function disableLocalAI(){aiCancel();state.settings.ai.enabled=false;await saveMeta();renderAll();toast("Local AI disabled. Your deterministic reviewer remains available.");}
 function renderAI(){
-  const d=activeDoc(),ai=d?.ai||{},p=learnerProfile(),info=window.StudyVaultAI?.getRuntimeInfo?.()||{};
-  const status=$("#aiStatus");
-  if(status)status.textContent=ai.generatedAt?`AI reviewer saved • grounded ${ai.groundingScore||0}% • ${ai.device||"local"}`:(info.loaded?"Local AI loaded — ready to personalize this material.":"Local AI is optional. Enable it here or in Settings.");
-  const box=$("#aiReviewer");if(box)box.textContent=ai.reviewer||"No AI rewrite yet. The deterministic reviewer remains available below.";
-  const weak=$("#weakConcepts");if(weak){const ws=weakConcepts();weak.innerHTML=ws.length?ws.map(x=>`<span class="term">${esc(x)}</span>`).join(""):'<span class="tiny">Your weak areas appear after you study and answer questions.</span>';}
-  const entries=Object.values(p.concepts||{}),avg=entries.length?entries.reduce((sum,x)=>sum+(Number(x.mastery)||0),0)/entries.length:0;
-  const bar=$("#aiMasteryBar");if(bar)bar.style.width=`${Math.round(avg*100)}%`;
-  const mt=$("#aiMasteryText");if(mt)mt.textContent=entries.length?`Overall concept mastery: ${Math.round(avg*100)}% • ${p.sessions||0} sessions • streak ${p.streak||0}`:'No mastery data yet.';
-  const dev=$("#aiDevice");if(dev)dev.textContent=info.loaded?`${info.model} • ${info.device}`:`Model: on-device Qwen2.5 0.5B • ${navigator.gpu?"WebGPU available":"WASM fallback"}`;
-  const settingsInfo=$("#settingsAiInfo");if(settingsInfo)settingsInfo.textContent=info.loaded?`Loaded locally • ${info.device} • browser cache enabled when supported`:(state.settings.ai?.enabled?"AI enabled; load the model when needed.":"AI is optional; deterministic review works without it.");
+  const d=activeDoc(),ai=d?.ai||{},p=learnerProfile();
+  const status=$("#aiStatus");const info=$("#aiDevice");
+  if(status&&!ai.generatedAt)status.textContent=state.settings.ai?.enabled?"Local AI enabled — load it from Settings or run it below.":"Optional on-device AI. Your study source stays in your browser during inference.";
+  if($("#aiReviewer"))$("#aiReviewer").textContent=ai.reviewer||"No AI rewrite yet. The deterministic source-grounded reviewer remains available below.";
+  const weak=$("#weakConcepts");if(weak){const ws=weakConcepts();weak.innerHTML=ws.length?ws.map(x=>`<span class="term">${esc(x)}</span>`).join(""):"<span class='tiny'>Weak areas appear after you study and answer questions.</span>";}
+  const entries=Object.values(p.concepts||{}),avg=entries.length?entries.reduce((s,x)=>s+(Number(x.mastery)||0),0)/entries.length:0;if($("#aiMasteryBar"))$("#aiMasteryBar").style.width=`${Math.round(avg*100)}%`;if($("#aiMasteryText"))$("#aiMasteryText").textContent=entries.length?`Overall mastery ${Math.round(avg*100)}% • ${p.sessions||0} sessions • streak ${p.streak||0}`:"No mastery data yet.";
+  if(info)info.textContent=ai.model?`${ai.model} • ${ai.device||"local"}`:`Model: on-device Qwen3 0.6B • first load downloads model files`;
+  const settingsInfo=$("#settingsAiInfo");if(settingsInfo)settingsInfo.textContent=state.settings.ai?.enabled?"AI enabled. The model loads in a worker so the UI remains interactive.":"AI is optional; deterministic review works without it.";
 }
 
-function applyTheme(){document.body.classList.toggle('light',state.settings.theme==='light');}
+function updateConnectivity(){
+  const el=$("#networkStatus");
+  if(!el)return;
+  const online=navigator.onLine;
+  el.textContent=online?"ONLINE • AI available":"OFFLINE • study mode available";
+  el.classList.toggle("offline",!online);
+  const aiButtons=[$("#aiEnable"),$("#settingsAiEnable")].filter(Boolean);
+  if(!online){for(const b of aiButtons)b.title="The app still works offline. Local AI needs the model to have been downloaded and cached first.";}
+}
+function applyTheme(){document.body.classList.toggle('light',state.settings.theme==='light');updateConnectivity();}
 async function setTheme(theme){state.settings.theme=theme==='light'?'light':'dark';await saveMeta();applyTheme();toast(`${state.settings.theme==='light'?'Light':'Dark'} mode enabled.`,'success');}
 
 function exportBackup(){
-  const payload={app:'StudyVault',version:APP_VERSION,exportedAt:now(),settings:{theme:state.settings.theme,ai:{enabled:!!state.settings.ai?.enabled,model:state.settings.ai?.model||"onnx-community/Qwen2.5-0.5B-Instruct"},learner:learnerProfile()},documents:state.documents};
+  const payload={app:'StudyVault',version:APP_VERSION,exportedAt:now(),settings:{theme:state.settings.theme,ai:{enabled:!!state.settings.ai?.enabled,model:state.settings.ai?.model||"onnx-community/Qwen3-0.6B-ONNX"},learner:learnerProfile()},documents:state.documents};
   downloadText(`studyvault-backup-${new Date().toISOString().slice(0,10)}.json`,JSON.stringify(payload,null,2));toast('Backup exported.','success');
 }
 async function importBackup(){
@@ -901,7 +994,7 @@ async function importBackup(){
     const data=JSON.parse(await file.text());if(data.app!=='StudyVault')throw new Error('Invalid StudyVault backup.');
     const incoming=Array.isArray(data.documents)?data.documents:(data.data?.fileName?[data.data]:null);if(!incoming)throw new Error('No StudyVault documents found in this backup.');
     for(const raw of incoming){const d=normalizeDoc(raw);await dbPut(DOC_STORE,d);}
-    state.documents=(await dbGetAll(DOC_STORE)).map(normalizeDoc);state.activeDocId=state.documents[0]?.id||null;state.settings.theme=data.settings?.theme==='light'?'light':'dark';state.settings.learner={...defaultLearner(),...(data.settings?.learner||{})};state.settings.ai={...state.settings.ai,...(data.settings?.ai||{enabled:false})};await saveMeta();$("#importModal").classList.remove('open');$("#backupInput").value='';renderAll();toast('Backup imported.','success');
+    state.documents=(await dbGetAll(DOC_STORE)).map(normalizeDoc);state.activeDocId=state.documents[0]?.id||null;state.settings.theme=data.settings?.theme==='light'?'light':'dark';state.settings.learner={...defaultLearner(),...(data.settings?.learner||{})};state.settings.ai={...state.settings.ai,model:"onnx-community/Qwen3-0.6B-ONNX",...(data.settings?.ai||{enabled:false})};await saveMeta();$("#importModal").classList.remove('open');$("#backupInput").value='';renderAll();toast('Backup imported.','success');
   }catch(e){console.error(e);toast(e.message||'Import failed.','error');}
 }
 async function resetAll(){if(!confirm('Delete ALL StudyVault data from this browser? This removes every document, note, quiz history, and PIN.'))return;await dbClear();location.reload();}
@@ -931,8 +1024,8 @@ function bind(){
   $$('[data-section]').forEach(b=>b.addEventListener('click',()=>activateSection(b.dataset.section)));
   $$('[data-summary-mode]').forEach(b=>b.addEventListener('click',()=>setSummaryMode(b.dataset.summaryMode)));
   $("#openReviewer").onclick=()=>activateSection('reviewer');
-  $("#aiEnable").onclick=enableLocalAI;$("#aiEnhance").onclick=runLocalAIEnhancement;$("#settingsAiEnable").onclick=enableLocalAI;$("#settingsAiDisable").onclick=disableLocalAI;
-  $("#aiAsk").onclick=async()=>{const d=activeDoc(),q=$("#aiQuestion").value.trim(),out=$("#aiAnswer");if(!d)return toast("Select a study material first.","error");if(!q)return toast("Write a question first.","error");out.textContent="Thinking locally…";try{out.textContent=await window.StudyVaultAI.ask(d,learnerProfile(),q,{progress:m=>{out.textContent=m.message||"Loading local AI…";}});}catch(e){out.textContent="Local AI could not answer this yet.";toast(e.message||"Local AI unavailable.","error");}};
+  $("#aiEnable").onclick=enableLocalAI;$("#aiEnhance").onclick=runLocalAIEnhancement;$("#aiCancel").onclick=aiCancel;$("#settingsAiEnable").onclick=enableLocalAI;$("#settingsAiDisable").onclick=disableLocalAI;
+  $("#aiAsk").onclick=async()=>{const d=activeDoc(),q=$("#aiQuestion").value.trim(),out=$("#aiAnswer");if(!d)return toast("Select a study material first.","error");if(!q)return toast("Write a question first.","error");out.textContent="Thinking locally…";try{const r=await aiRequest("ask",{source:aiQuestionSource(d,q),profile:learnerDigestForAI(),question:q});out.textContent=r.text;toast("Answer generated from the study material.","success");}catch(e){out.textContent=e.message==="AI task cancelled."?"AI stopped.":"Local AI could not answer this yet.";if(e.message!=="AI task cancelled.")toast(e.message||"Local AI unavailable.","error");}};
   $("#copyReviewer").onclick=copyReviewer;$("#downloadReviewer").onclick=downloadReviewer;$("#regenerateReviewer").onclick=async()=>{const d=activeDoc();if(!d)return toast('Select a document first.','error');regenerateDoc(d,true);await saveDoc(d);renderAll();toast('Reviewer, flashcards, and quiz regenerated.','success');};
   $("#prevFlash").onclick=()=>moveFlash(-1);$("#nextFlash").onclick=()=>moveFlash(1);$("#showFlashAnswer").onclick=()=>activeDoc()&&$("#flashAnswer").classList.remove('hidden');$("#knowFlash").onclick=()=>markKnown(true);$("#reviewFlash").onclick=()=>markKnown(false);
   $("#submitQuiz").onclick=submitQuiz;$("#newQuiz").onclick=newQuiz;
@@ -967,6 +1060,9 @@ async function load(){
 window.addEventListener("unhandledrejection",e=>{console.error(e.reason||e);toast("A background task failed. Your saved study data was kept.","error");});
 window.addEventListener("error",e=>{if(e?.error)console.error(e.error);});
 
+window.addEventListener("online",updateConnectivity);
+window.addEventListener("offline",updateConnectivity);
+updateConnectivity();
 bind();
 setEngineStatus("idle — loads when a PDF is added");
 if('serviceWorker' in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('./service-worker.js').catch(err=>console.warn('Service worker registration failed:',err)));
