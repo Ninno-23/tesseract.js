@@ -2,7 +2,7 @@
 (() => {
 "use strict";
 
-const APP_VERSION = 5;
+const APP_VERSION = 9;
 const DB_NAME = "studyvault-v5";
 const DB_VERSION = 1;
 const DOC_STORE = "documents";
@@ -30,11 +30,17 @@ const debounce = (fn, ms=350) => { let t; return (...args) => { clearTimeout(t);
 const STOP = new Set(("a an and are as at be because been before being between but by can could did do does for from had has have he her here hers him his how i if in into is it its itself just may me might more most my no not of on one or our ours out over same she should so some than that the their theirs them themselves then there these they this those through to too under up us was we were what when where which while who whom why will with would you your yours about after again against all also among another any anything around become below both during each either enough even every example few first following further given going having however important later least little many maybe much must never often other otherwise perhaps rather since such very want without within yet" ).split(/\s+/));
 
 let state = {
-  settings: { theme:"dark", pinHash:"", pinSalt:"", pinIterations:120000 },
+  settings: { theme:"dark", pinHash:"", pinSalt:"", pinIterations:120000, ai:{enabled:false,model:"onnx-community/Qwen2.5-0.5B-Instruct"}, learner:{version:1,sessions:0,streak:0,recentAccuracy:null,concepts:{}} },
   documents: [],
   activeDocId: null
 };
 let deferredInstall = null;
+function defaultLearner(){return {version:1,sessions:0,streak:0,recentAccuracy:null,concepts:{}};}
+function learnerProfile(){state.settings.learner={...defaultLearner(),...(state.settings.learner||{}),concepts:{...(state.settings.learner?.concepts||{})}};return state.settings.learner;}
+function adaptConcept(concept,correct){if(!concept)return;const p=learnerProfile();const key=normalize(concept).toLowerCase();if(!key)return;const prev=p.concepts[key]||{label:normalize(concept),attempts:0,correct:0,streak:0,mastery:0.35,lastSeen:0,dueAt:0};const attempts=prev.attempts+1;const good=prev.correct+(correct?1:0);const streak=correct?prev.streak+1:0;const mastery=clamp((good/attempts)*.72+(Math.min(streak,4)/4)*.18+prev.mastery*.10,0,1);prev.attempts=attempts;prev.correct=good;prev.streak=streak;prev.mastery=mastery;prev.lastSeen=Date.now();prev.dueAt=Date.now()+(correct?Math.min(1000*60*60*24*30,1000*60*20*Math.pow(2,Math.min(8,streak))):1000*60*3);p.concepts[key]=prev;}
+function recordStudyResult(concepts,accuracy){const p=learnerProfile();p.sessions=(p.sessions||0)+1;p.recentAccuracy=accuracy;const strong=accuracy>=.85;if(strong)p.streak=(p.streak||0)+1;else p.streak=0;for(const c of concepts||[])adaptConcept(c,accuracy>=.7);return p;}
+function weakConcepts(limit=8){const p=learnerProfile();return Object.values(p.concepts||{}).sort((a,b)=>(a.mastery||0)-(b.mastery||0)).slice(0,limit).map(x=>x.label);}
+
 
 function toast(message,type=""){
   const el=$("#toast");
@@ -100,70 +106,59 @@ async function getOcrWorker(progress){
   return tesseractWorker;
 }
 async function ocrImage(file,progress){const worker=await getOcrWorker(progress);const ret=await worker.recognize(file);return {text:normalize(ret?.data?.text||""),confidence:Number(ret?.data?.confidence)||0};}
-function dataUrlFromFile(file,maxSide=1900,quality=.86){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>{const img=new Image();img.onload=()=>{const scale=Math.min(1,maxSide/Math.max(img.naturalWidth,img.naturalHeight));const w=Math.max(1,Math.round(img.naturalWidth*scale)),h=Math.max(1,Math.round(img.naturalHeight*scale));const c=document.createElement("canvas");c.width=w;c.height=h;const ctx=c.getContext("2d");ctx.drawImage(img,0,0,w,h);resolve({dataUrl:c.toDataURL("image/jpeg",quality),width:w,height:h});};img.onerror=()=>reject(new Error("Could not read the image."));img.src=reader.result;};reader.onerror=()=>reject(reader.error||new Error("Could not read the image."));reader.readAsDataURL(file);});}
+function dataUrlFromFile(file,maxSide=1500,quality=.78){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>{const img=new Image();img.onload=()=>{const scale=Math.min(1,maxSide/Math.max(img.naturalWidth,img.naturalHeight));const w=Math.max(1,Math.round(img.naturalWidth*scale)),h=Math.max(1,Math.round(img.naturalHeight*scale));const c=document.createElement("canvas");c.width=w;c.height=h;const ctx=c.getContext("2d");ctx.drawImage(img,0,0,w,h);resolve({dataUrl:c.toDataURL("image/jpeg",quality),width:w,height:h});};img.onerror=()=>reject(new Error("Could not read the image."));img.src=reader.result;};reader.onerror=()=>reject(reader.error||new Error("Could not read the image."));reader.readAsDataURL(file);});}
 
+let dbPromise=null;
+let writeQueue=Promise.resolve();
 function openDB(){
-  return new Promise((resolve,reject)=>{
+  if(dbPromise)return dbPromise;
+  dbPromise=new Promise((resolve,reject)=>{
     const r=indexedDB.open(DB_NAME,DB_VERSION);
     r.onupgradeneeded=()=>{
       const db=r.result;
       if(!db.objectStoreNames.contains(DOC_STORE))db.createObjectStore(DOC_STORE,{keyPath:"id"});
       if(!db.objectStoreNames.contains(META_STORE))db.createObjectStore(META_STORE);
     };
-    r.onsuccess=()=>resolve(r.result);
+    r.onsuccess=()=>{const db=r.result;db.onversionchange=()=>db.close();resolve(db);};
     r.onerror=()=>reject(r.error);
-  });
+  }).catch(err=>{dbPromise=null;throw err;});
+  return dbPromise;
+}
+function txRequest(store,mode,action){
+  return openDB().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(store,mode);let request;
+    try{request=action(tx.objectStore(store));}catch(err){reject(err);return;}
+    if(request){request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);}
+    tx.onabort=()=>reject(tx.error||new Error("IndexedDB transaction aborted."));
+    tx.onerror=()=>reject(tx.error||new Error("IndexedDB transaction failed."));
+    tx.oncomplete=()=>{if(!request)resolve();};
+  }));
+}
+function queueWrite(fn){
+  writeQueue=writeQueue.catch(()=>{}).then(fn);
+  return writeQueue;
 }
 async function dbPut(store,keyOrValue,value){
-  const db=await openDB();
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(store,"readwrite");
-    const os=tx.objectStore(store);
-    if(value===undefined)os.put(keyOrValue);else os.put(value,keyOrValue);
-    tx.oncomplete=()=>{db.close();resolve();};
-    tx.onerror=()=>{db.close();reject(tx.error);};
-  });
+  return queueWrite(()=>txRequest(store,"readwrite",os=>value===undefined?os.put(keyOrValue):os.put(value,keyOrValue)));
 }
-async function dbGet(store,key){
-  const db=await openDB();
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(store,"readonly");
-    const r=tx.objectStore(store).get(key);
-    r.onsuccess=()=>resolve(r.result);
-    r.onerror=()=>reject(r.error);
-    tx.oncomplete=()=>db.close();
-  });
-}
-async function dbGetAll(store){
-  const db=await openDB();
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(store,"readonly");
-    const r=tx.objectStore(store).getAll();
-    r.onsuccess=()=>resolve(r.result||[]);
-    r.onerror=()=>reject(r.error);
-    tx.oncomplete=()=>db.close();
-  });
-}
-async function dbDelete(store,key){
-  const db=await openDB();
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(store,"readwrite");
-    tx.objectStore(store).delete(key);
-    tx.oncomplete=()=>{db.close();resolve();};
-    tx.onerror=()=>{db.close();reject(tx.error);};
-  });
-}
+async function dbGet(store,key){return txRequest(store,"readonly",os=>os.get(key));}
+async function dbGetAll(store){return txRequest(store,"readonly",os=>os.getAll());}
+async function dbDelete(store,key){return queueWrite(()=>txRequest(store,"readwrite",os=>os.delete(key)));}
 async function dbClear(){
-  const db=await openDB();
-  return new Promise((resolve,reject)=>{
+  return queueWrite(()=>openDB().then(db=>new Promise((resolve,reject)=>{
     const tx=db.transaction([DOC_STORE,META_STORE],"readwrite");
     tx.objectStore(DOC_STORE).clear();tx.objectStore(META_STORE).clear();
-    tx.oncomplete=()=>{db.close();resolve();};
-    tx.onerror=()=>{db.close();reject(tx.error);};
-  });
+    tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error("Clear failed."));
+  })));
 }
-async function saveDoc(doc){doc.updatedAt=now();await dbPut(DOC_STORE,doc);}
-async function saveMeta(){await dbPut(META_STORE,SETTINGS_KEY,{...state.settings,activeDocId:state.activeDocId,version:APP_VERSION});}
+async function saveDoc(doc){
+  doc.updatedAt=now();
+  try{await dbPut(DOC_STORE,doc);}catch(err){
+    if(err?.name==="QuotaExceededError")throw new Error("Browser storage is full. Remove large photos or export a backup, then try again.");
+    throw err;
+  }
+}
+async function saveMeta(){await dbPut(META_STORE,SETTINGS_KEY,{...state.settings,activeDocId:state.activeDocId,version:APP_VERSION,engine:REVIEW_ENGINE_VERSION});}
 
 async function derivePin(pin,salt,iterations=120000){
   const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(pin),"PBKDF2",false,["deriveBits"]);
@@ -182,10 +177,17 @@ async function setPin(){
   state.settings.pinHash=await derivePin(a,salt,state.settings.pinIterations);
   await saveMeta();closePin();toast("PIN protection enabled.","success");
 }
+function constantTimeEqual(a,b){
+  const A=String(a||""),B=String(b||"");
+  let diff=A.length^B.length;
+  const n=Math.max(A.length,B.length);
+  for(let i=0;i<n;i++)diff|=(A.charCodeAt(i%n)||0)^(B.charCodeAt(i%n)||0);
+  return diff===0;
+}
 async function verifyPin(pin){
   if(!state.settings.pinHash||!state.settings.pinSalt)return false;
   const hash=await derivePin(pin,b64ToBytes(state.settings.pinSalt),state.settings.pinIterations||120000);
-  return hash===state.settings.pinHash;
+  return constantTimeEqual(hash,state.settings.pinHash);
 }
 async function removePin(){
   if(!state.settings.pinHash)return toast("No PIN is enabled.");
@@ -205,152 +207,393 @@ async function unlockApp(){
   else $("#unlockMsg").textContent="Incorrect PIN.";
 }
 
-function tokenize(text){return normalize(text).toLowerCase().replace(/[^a-z0-9\s'-]/g," ").split(/\s+/).filter(Boolean);}
+function tokenize(text){
+  return normalize(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s'-]/g," ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+const REVIEW_ENGINE_VERSION = 9;
+const SUMMARY_MODES = {
+  quick:    {label:"Quick Scan", sentenceCount:6,  maxChars:900},
+  standard: {label:"Standard",   sentenceCount:10, maxChars:1500},
+  deep:     {label:"Deep Review",sentenceCount:16, maxChars:2400},
+  cram:     {label:"Exam Cram",  sentenceCount:8,  maxChars:1200}
+};
+
 function stableId(prefix,text){
   let h=2166136261;
-  for(let i=0;i<text.length;i++){h^=text.charCodeAt(i);h=Math.imul(h,16777619);}
-  return `${prefix}-${(h>>>0).toString(16)}`;
+  for(let i=0;i<String(text).length;i++){
+    h^=String(text).charCodeAt(i);
+    h=Math.imul(h,16777619);
+  }
+  return `${prefix}-${(h>>>0).toString(36)}`;
 }
+
 function similarity(a,b){
-  const A=new Set(tokenize(a)),B=new Set(tokenize(b));let common=0;
-  for(const x of A)if(B.has(x))common++;
-  const union=new Set([...A,...B]).size;return union?common/union:0;
+  const A=new Set(tokenize(a).filter(x=>x.length>2));
+  const B=new Set(tokenize(b).filter(x=>x.length>2));
+  if(!A.size&&!B.size)return 1;
+  let common=0;for(const x of A)if(B.has(x))common++;
+  return common/Math.max(1,new Set([...A,...B]).size);
 }
 
-function extractSentences(text,min=28){
-  const cleaned=normalize(text);
-  if(!cleaned)return [];
-  const raw=[];
-  for(const part of cleaned.split(/\n+/)){
-    const line=part.trim();
-    if(!line)continue;
-    const pieces=line.match(/[^.!?;]+(?:[.!?]+|;|$)/g)||[line];
-    for(const p of pieces){const s=normalize(p);if(s.length>=min)raw.push(s);}
-  }
-  const seen=new Set();
-  return raw.filter(s=>{const k=s.toLowerCase();if(seen.has(k))return false;seen.add(k);return true;});
-}
-
-function extractTerms(text){
-  const toks=tokenize(text);const uni=new Map(),bi=new Map(),tri=new Map();
-  for(const w of toks){
-    if(w.length<4||w.length>28||STOP.has(w)||/^\d+$/.test(w))continue;
-    uni.set(w,(uni.get(w)||0)+1);
-  }
-  for(let i=0;i<toks.length-1;i++){
-    const a=toks[i],b=toks[i+1];
-    if(a.length>=4&&b.length>=4&&!STOP.has(a)&&!STOP.has(b)){
-      const k=`${a} ${b}`;bi.set(k,(bi.get(k)||0)+1);
-      if(i<toks.length-2){const c=toks[i+2];if(c.length>=4&&!STOP.has(c)){const t=`${a} ${b} ${c}`;tri.set(t,(tri.get(t)||0)+1)}}
+function extractSentences(text,min=24){
+  const cleaned=String(text||"").replace(/\r/g,"");
+  if(!cleaned.trim())return [];
+  const out=[];
+  for(const rawLine of cleaned.split(/\n+/)){
+    const line=normalize(rawLine);if(!line)continue;
+    const parts=line.match(/[^.!?]+(?:[.!?]+|$)/g)||[line];
+    for(const part of parts){
+      let sentence=normalize(part);
+      // Drop title-like fragments and tiny continuation clauses that look like sentences.
+      if(/^(?:next|then|finally|first|second|third|lastly)\s*[,;:-]/i.test(sentence)&&sentence.length<90)continue;
+      if(sentence.length>=min)out.push(sentence);
     }
   }
-  const ranked=[...uni.entries()].map(([term,freq])=>({term,freq,score:freq+(freq>=3?1.4:0)+(freq>=7?1.3:0)+(term.includes("-")?1:0)})).sort((a,b)=>b.score-a.score);
-  const phrases=[...bi.entries()].filter(([,f])=>f>=2).map(([term,freq])=>({term,freq,score:freq*2.6})).sort((a,b)=>b.score-a.score);
-  const triples=[...tri.entries()].filter(([,f])=>f>=2).map(([term,freq])=>({term,freq,score:freq*3.2})).sort((a,b)=>b.score-a.score);
+  const seen=new Set();
+  return out.filter(x=>{const k=x.toLowerCase();if(seen.has(k))return false;seen.add(k);return true;});
+}
+
+function sentenceUnits(doc){
+  if(Array.isArray(doc.units)&&doc.units.length)return doc.units.filter(u=>normalize(u.text));
   const out=[];
-  for(const item of [...triples,...phrases,...ranked]){
-    const term=item.term;
-    if(out.some(x=>x.toLowerCase()===term.toLowerCase()))continue;
-    if(out.some(x=>similarity(x,term)>.82))continue;
-    out.push(term);
-    if(out.length>=32)break;
+  for(const p of doc.pageTexts||[]){
+    for(const text of extractSentences(p.text||"",20))out.push({page:p.page,text,source:p.source||"page",photoId:p.photoId||null});
+  }
+  for(const m of doc.media||[]){
+    const combined=normalize(`${m.caption||""}\n${m.ocrText||""}`);
+    for(const text of extractSentences(combined,18))out.push({page:null,text,source:"photo",photoId:m.id});
   }
   return out;
 }
 
-function detectDefinitions(sentences,terms){
-  const patterns=[/\b(.+?)\s+(?:is|are|means|refers to|defined as|known as|is called|can be defined as)\b/i,/\b(.+?)\s*:\s*(.+)/i];
-  const defs=[];
-  for(const s of sentences){
-    if(defs.length>=16)break;
-    if(patterns[0].test(s)||patterns[1].test(s)){
-      const low=s.toLowerCase();
-      const term=terms.find(t=>low.includes(t.toLowerCase()));
-      if(term&&!defs.some(d=>d.term.toLowerCase()===term.toLowerCase()))defs.push({term,definition:s});
+function candidateTerms(doc){
+  const units=sentenceUnits(doc), all=units.map(u=>u.text).join(" \n");
+  const tokens=tokenize(all).filter(w=>w.length>=4&&w.length<=28&&!STOP.has(w)&&!/^\d+$/.test(w));
+  const freq=new Map(), spread=new Map(), firstPos=new Map();
+  tokens.forEach((w,i)=>{
+    freq.set(w,(freq.get(w)||0)+1);
+    if(!firstPos.has(w))firstPos.set(w,i);
+  });
+  for(const u of units){const seen=new Set(tokenize(u.text));for(const w of seen)if(freq.has(w))spread.set(w,(spread.get(w)||0)+1);}
+  const phrases=new Map();
+  const normTokens=tokenize(all);
+  for(let i=0;i<normTokens.length-1;i++){
+    const a=normTokens[i],b=normTokens[i+1];
+    if([a,b].every(w=>w.length>=4&&!STOP.has(w))){
+      const k=`${a} ${b}`;phrases.set(k,(phrases.get(k)||0)+1);
     }
+  }
+  const ranked=[...freq].map(([term,f])=>({term,f,score:f*1.15+(spread.get(term)||0)*1.5+(f>=3?2:0)+((firstPos.get(term)||0)<Math.max(40,tokens.length*.12)?1.2:0)}));
+  const phraseRanked=[...phrases].filter(([,f])=>f>=2).map(([term,f])=>({term,f,score:f*3.4}));
+  const result=[];
+  for(const item of [...phraseRanked.sort((a,b)=>b.score-a.score),...ranked.sort((a,b)=>b.score-a.score)]){
+    const t=item.term;
+    if(result.some(x=>x.toLowerCase()===t.toLowerCase()))continue;
+    if(result.some(x=>similarity(x,t)>.80))continue;
+    result.push(t);
+    if(result.length>=40)break;
+  }
+  return result;
+}
+
+function detectHeadings(doc){
+  const headings=[];
+  for(const p of doc.pageTexts||[]){
+    const lines=String(p.text||"").split(/\n+/).map(normalize).filter(Boolean);
+    for(const line of lines){
+      const words=line.split(/\s+/);
+      const alpha=line.replace(/[^A-Za-z]/g,"");
+      const titleCase=/^(?:[A-Z][A-Za-z0-9-]*\s*){1,10}$/.test(line);
+      const numbered=/^(?:\d+(?:\.\d+)*[.)]|[IVXLC]+[.)]|[A-Z][.)])\s+/.test(line);
+      if((words.length<=12&&line.length<=100&&alpha.length>=5&&(titleCase||numbered||line===line.toUpperCase()))){
+        if(!/^(page|chapter|figure|table)\s*\d*$/i.test(line))headings.push({text:line,page:p.page});
+      }
+    }
+  }
+  const seen=new Set();return headings.filter(h=>{const k=h.text.toLowerCase();if(seen.has(k))return false;seen.add(k);return true;}).slice(0,40);
+}
+
+function patternHits(text,re){return re.test(text);}
+function unitPage(u){return u?.page??null;}
+function contextHeading(page,headings){
+  const list=headings.filter(h=>Number(h.page)<=Number(page));
+  return list.length?list[list.length-1].text:"";
+}
+
+function detectDefinitions(units,terms){
+  const defs=[];const patterns=[
+    /^(.{2,80}?)\s+(?:is|are|means|refers to|is defined as|are defined as|is known as|is called)\s+(.{12,})$/i,
+    /^(.{2,80}?)\s*:\s*(.{12,})$/i,
+    /(?:the term|the concept|the process)\s+(.{2,80}?)\s+(?:is|means|refers to)\s+(.{12,})/i
+  ];
+  for(const u of units){
+    const text=normalize(u.text); if(text.length<30)continue;
+    let hit=null;
+    for(const re of patterns){const m=text.match(re);if(m){hit=m;break;}}
+    let term=hit?.[1]?.trim()||terms.find(t=>text.toLowerCase().includes(t.toLowerCase()));
+    if(!term)continue;
+    term=term.replace(/^(the|a|an)\s+/i,"").trim();
+    if(term.length>70)term=terms.find(t=>text.toLowerCase().includes(t.toLowerCase()))||term;
+    if(!term||term.length<3)continue;
+    if(defs.some(d=>d.term.toLowerCase()===term.toLowerCase()))continue;
+    const cue=hit? (hit[2]||text):text;
+    const confidence=Math.min(0.98,0.60+(hit?0.22:0)+(text.length<260?0.08:0)+(unitPage(u)?0.04:0));
+    defs.push({term,definition:text,page:unitPage(u),confidence});
+    if(defs.length>=24)break;
   }
   return defs;
 }
 
-function sentenceScore(s,terms){
-  const l=s.toLowerCase();let score=0;
-  for(const t of terms.slice(0,22))if(l.includes(t.toLowerCase()))score+=2;
-  if(/\b(is|are|means|refers to|defined as|known as|is called|consists of)\b/i.test(s))score+=6;
-  if(/\b(function|purpose|process|used|example|important|include|includes|types|steps|characteristics|advantages|disadvantages|difference|cause|effect|result)\b/i.test(s))score+=3;
-  if(/\b(first|second|third|finally|therefore|because|however|for example|such as)\b/i.test(s))score+=2;
-  if(/\d/.test(s))score+=1;
-  if(s.length>=55&&s.length<=280)score+=2;
-  if(s.length>360)score-=2;
+function classifyUnit(u,terms){
+  const text=u.text||"", low=text.toLowerCase();
+  const hits=[];
+  if(/\b(is|are|means|refers to|defined as|known as|called)\b/i.test(text))hits.push("definition");
+  if(/\b(first|second|third|next|then|finally|step|procedure|process|stage|phase)\b/i.test(text))hits.push("process");
+  if(/\b(because|therefore|causes?|results? in|leads? to|due to|as a result|consequently)\b/i.test(text))hits.push("cause-effect");
+  if(/\b(whereas|while|unlike|compared with|in contrast|difference between|similar to|both)\b/i.test(text))hits.push("comparison");
+  if(/\b(for example|for instance|such as|e\.g\.)\b/i.test(text))hits.push("example");
+  if(/\b(important|key|note|remember|warning|caution|must)\b/i.test(text))hits.push("exam-focus");
+  if(/\d|%|\b(?:Hz|V|A|W|Ω|ohm|kg|m|cm|mm)\b|[A-Za-z]\s*=\s*[^ ]/i.test(text))hits.push("fact-formula");
+  const overlap=terms.slice(0,28).reduce((n,t)=>n+(low.includes(t.toLowerCase())?1:0),0);
+  return {hits,overlap};
+}
+
+function scoreUnit(u,terms,headings,position,total){
+  const f=classifyUnit(u,terms), text=u.text||"";let score=f.overlap*2.2+f.hits.length*2;
+  if(text.length>=55&&text.length<=300)score+=2.5;
+  if(text.length>420)score-=2;
+  if(position<Math.max(3,total*.12))score+=1.7;
+  if(f.hits.includes("definition"))score+=4;
+  if(f.hits.includes("exam-focus"))score+=3;
+  if(f.hits.includes("cause-effect")||f.hits.includes("comparison")||f.hits.includes("process"))score+=2.3;
+  const h=contextHeading(unitPage(u),headings);if(h)score+=1;
   return score;
 }
 
-function pickDiverse(sentences,terms,count){
-  const ranked=sentences.map((s,i)=>({s,i,score:sentenceScore(s,terms)})).sort((a,b)=>b.score-a.score);
-  const chosen=[];
-  for(const x of ranked){
-    if(chosen.some(y=>similarity(y.s,x.s)>.62))continue;
-    chosen.push(x);
-    if(chosen.length>=count)break;
+function selectEvidence(units,terms,headings,count,filterFn=()=>true){
+  const ranked=units.map((u,i)=>({u,i,score:scoreUnit(u,terms,headings,i,units.length)})).filter(x=>filterFn(x.u)).sort((a,b)=>b.score-a.score);
+  const picked=[];
+  for(const item of ranked){
+    if(picked.some(x=>similarity(x.u.text,item.u.text)>.58))continue;
+    picked.push(item);if(picked.length>=count)break;
   }
-  return chosen.sort((a,b)=>a.i-b.i);
+  return picked.sort((a,b)=>a.i-b.i);
 }
 
-function contextForTerm(term,units){
-  const l=term.toLowerCase();
-  const hits=units.filter(u=>u.text.toLowerCase().includes(l)).sort((a,b)=>sentenceScore(b.text,[term])-sentenceScore(a.text,[term]));
-  return hits[0]||null;
+function synthesizeSummary(units,terms,headings,mode){
+  const cfg=SUMMARY_MODES[mode]||SUMMARY_MODES.standard;
+  const evidence=selectEvidence(units,terms,headings,cfg.sentenceCount);
+  if(!evidence.length)return "Not enough readable source text was found to create an automatic summary.";
+  const topic=terms.slice(0,5).join(", ");
+  const lines=[];
+  if(topic)lines.push(`This material focuses on ${topic}.`);
+  const byKind={definition:[],process:[],"cause-effect":[],comparison:[],example:[],"fact-formula":[]};
+  for(const e of evidence){const kinds=classifyUnit(e.u,terms).hits;const key=kinds.find(k=>byKind[k])||"general";(byKind[key]??(byKind[key]=[])).push(e.u);}
+  const general=evidence.map(e=>e.u);
+  const narrative=general.slice(0,cfg.sentenceCount).map(u=>u.text);
+  const seen=[];
+  for(const n of narrative){
+    const clean=normalize(n.replace(/^(note|important|remember)\s*[:.-]?\s*/i,""));
+    if(!seen.some(x=>similarity(x,clean)>.62))seen.push(clean);
+  }
+  if(mode==="cram"){
+    for(const u of seen.slice(0,8))lines.push(`• ${u}`);
+  }else{
+    if(byKind.definition?.length)lines.push(`Core concepts: ${byKind.definition.slice(0,2).map(x=>x.text).join(" ")}`);
+    for(const u of seen){
+      if(lines.join(" ").length>cfg.maxChars)break;
+      lines.push(`• ${u}`);
+    }
+  }
+  let out=normalize(lines.join("\n"));
+  if(out.length>cfg.maxChars)out=out.slice(0,cfg.maxChars-1).replace(/\s+\S*$/,'')+"…";
+  return out;
 }
-function bestDefinition(term,units){
-  const direct=units.filter(u=>u.text.toLowerCase().includes(term.toLowerCase())).sort((a,b)=>{
-    const cue=x=>/\b(is|are|means|refers to|defined as|known as|is called|consists of)\b/i.test(x.text)?4:0;
-    return (cue(b)+b.text.length*.001)-(cue(a)+a.text.length*.001);
-  })[0];
-  return direct||null;
+
+function detectStructuredPatterns(units,terms,headings){
+  const definitions=detectDefinitions(units,terms);
+  const processes=units.filter(u=>classifyUnit(u,terms).hits.includes("process")).slice(0,18).map(u=>({text:u.text,page:unitPage(u)}));
+  const causes=units.filter(u=>classifyUnit(u,terms).hits.includes("cause-effect")).slice(0,18).map(u=>({text:u.text,page:unitPage(u)}));
+  const comparisons=units.filter(u=>classifyUnit(u,terms).hits.includes("comparison")).slice(0,16).map(u=>({text:u.text,page:unitPage(u)}));
+  const examples=units.filter(u=>classifyUnit(u,terms).hits.includes("example")).slice(0,16).map(u=>({text:u.text,page:unitPage(u)}));
+  const facts=units.filter(u=>classifyUnit(u,terms).hits.includes("fact-formula")).slice(0,20).map(u=>({text:u.text,page:unitPage(u)}));
+  const keyPoints=selectEvidence(units,terms,headings,30).map(x=>({text:x.u.text,page:unitPage(x.u),heading:contextHeading(unitPage(x.u),headings),score:Math.round(x.score*10)/10}));
+  return {definitions,processes,causes,comparisons,examples,facts,keyPoints};
 }
 
 function buildReviewer(doc){
-  const units=doc.units||[];const sentences=units.map(u=>u.text).filter(Boolean);const terms=doc.terms||[];
-  const defs=detectDefinitions(sentences,terms).map(d=>{const u=units.find(x=>x.text===d.definition);return {...d,page:u?.page||null,source:u?.source||"page"};});
-  const picked=pickDiverse(sentences,terms,28).map(x=>{const u=units.find(y=>y.text===x.s);return {text:x.s,page:u?.page||null,source:u?.source||"page"};});
-  const overviewParts=pickDiverse(sentences,terms,6).map(x=>x.s);
-  if(overviewParts.length<3){for(const p of (doc.pageTexts||[])){if(p.text&&normalize(p.text).length>40){overviewParts.push(normalize(p.text).slice(0,380));if(overviewParts.length>=3)break;}}}
-  const overview=normalize(overviewParts.join(' ')).slice(0,1800);
+  const units=sentenceUnits(doc),terms=Array.isArray(doc.terms)&&doc.terms.length?doc.terms:candidateTerms(doc),headings=detectHeadings(doc);
+  const s=detectStructuredPatterns(units,terms,headings);
+  const overview=synthesizeSummary(units,terms,headings,doc.summaryMode||"standard");
+  const takeaways=selectEvidence(units,terms,headings,10).map(x=>({text:x.u.text,page:unitPage(x.u),heading:contextHeading(unitPage(x.u),headings)}));
+  const memory=terms.slice(0,18).map(term=>{const u=units.find(x=>x.text.toLowerCase().includes(term.toLowerCase()));return {term,clue:u?normalize(u.text).slice(0,180):`Connect ${term} to an example or purpose from the material.`,page:unitPage(u)};});
   const questions=[];
-  defs.slice(0,10).forEach(d=>questions.push({q:`Define ${d.term} in your own words and state one detail from the material.`,page:d.page}));
-  picked.filter(k=>!defs.some(d=>d.definition===k.text)).slice(0,10).forEach(k=>questions.push({q:`Explain the key idea from ${k.page?`page ${k.page}`:"this passage"} and why it matters.`,page:k.page}));
-  if(!questions.length)terms.slice(0,10).forEach(t=>questions.push({q:`What is ${t}, and what example, use, or purpose is associated with it?`,page:null}));
-  const memory=terms.slice(0,14).map(t=>{const c=contextForTerm(t,units);return {term:t,clue:c?normalize(c.text).slice(0,190):"Connect this term to an example from the material."};});
-  const checklist=[];defs.slice(0,8).forEach(d=>checklist.push(`Know the meaning of ${d.term}.`));picked.slice(0,8).forEach(k=>checklist.push(`Explain the key point from ${k.page?`page ${k.page}`:"the source"} without looking.`));(doc.media||[]).forEach((m,i)=>checklist.push(m.ocrText?`Review the text extracted from photo ${i+1}.`:`Review the visual information in photo ${i+1}.`));
-  const pages=[];for(const p of (doc.pageTexts||[])){const ps=p.text?extractSentences(p.text,18):[];if(ps.length){const top=pickDiverse(ps,terms,1)[0]?.s||ps[0];pages.push({page:p.page,text:top,source:p.source||"page"});}if(pages.length>=30)break;}
-  const visuals=(doc.media||[]).map((m,i)=>({id:m.id,index:i,name:m.name,dataUrl:m.dataUrl,caption:m.caption||"",ocrText:m.ocrText||"",confidence:m.confidence||0}));
-  const strategy=defs.length>=5?"Learn the definitions first, explain the key points aloud, use the memory cues, then take the quiz and revisit the cited page/photo for every mistake.":"Start with the key terms and key points. For each concept, say what it means, how it works or is used, and one example. Then use flashcards and the quiz to find weak areas.";
-  return {overview:overview||"The source did not yield enough clean sentences for an automatic summary. Use the key terms, visual material, and notes to complete the missing explanations.",strategy,definitions:defs.slice(0,18),keyPoints:picked.slice(0,28),pages,questions:questions.slice(0,18),memory,checklist:checklist.slice(0,20),visuals};
-}
-function makeFlashcards(doc){
-  const units=doc.units||[],cards=[],seen=new Set(),defs=detectDefinitions(units.map(u=>u.text),doc.terms||[]);
-  const add=(type,question,answer,term,page,source="page")=>{const q=normalize(question),a=normalize(answer);if(!q||!a)return;const id=stableId('fc',`${doc.id}|${type}|${term||''}|${q}|${a}`);if(seen.has(id))return;seen.add(id);cards.push({id,type,term:term||'',question:q,answer:a,page:page||null,source});};
-  defs.forEach(d=>{const u=units.find(x=>x.text===d.definition);add('definition',`What is "${d.term}"?`,d.definition,d.term,u?.page,u?.source||'page');});
-  for(const term of (doc.terms||[])){
-    const u=contextForTerm(term,units);if(!u)continue;const text=u.text;const escaped=term.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),re=new RegExp(`\\b${escaped}\\b`,'i');
-    if(re.test(text)&&text.length>=45)add('cloze',`Complete the statement:\n${text.replace(re,'_____')}`,term,term,u.page,u.source||'page');
-    add('explain',`Explain "${term}" using the material.`,text,term,u.page,u.source||'page');
-    add('example',`What example, use, or purpose is given for "${term}"?`,text,term,u.page,u.source||'page');
-    if(cards.length>=42)break;
+  s.definitions.slice(0,8).forEach(d=>questions.push({type:"definition",q:`Define ${d.term} in your own words and give one detail from the material.`,page:d.page}));
+  s.processes.slice(0,5).forEach(p=>questions.push({type:"process",q:`Explain the process or sequence described on page ${p.page??"the source"}.`,page:p.page}));
+  s.causes.slice(0,5).forEach(p=>questions.push({type:"cause-effect",q:`What cause-and-effect relationship is described in this point?`,page:p.page}));
+  s.comparisons.slice(0,4).forEach(p=>questions.push({type:"compare",q:`What two ideas are being compared or contrasted here?`,page:p.page}));
+  takeaways.slice(0,8).forEach(p=>questions.push({type:"recall",q:`Explain this key idea without looking at the source: ${p.text}`,page:p.page}));
+  const checklist=[];
+  terms.slice(0,10).forEach(t=>checklist.push(`Explain ${t} without reading the source.`));
+  s.definitions.slice(0,6).forEach(d=>checklist.push(`Give the definition of ${d.term} and one example.`));
+  if(s.processes.length)checklist.push("Reconstruct the important process steps from memory.");
+  if(s.causes.length)checklist.push("Explain the main cause-and-effect relationships.");
+  if(s.facts.length)checklist.push("Memorize the important formulas, numbers, units, or factual thresholds.");
+  (doc.media||[]).forEach((m,i)=>checklist.push(m.ocrText?`Review the text in photo ${i+1}.`:`Explain what photo ${i+1} is showing and why it matters.`));
+  const pages=[];
+  for(const p of doc.pageTexts||[]){
+    const pu=units.filter(u=>Number(u.page)===Number(p.page));
+    const top=selectEvidence(pu,terms,headings,1)[0]?.u;
+    if(top)pages.push({page:p.page,text:top.text,source:p.source||"page",heading:contextHeading(p.page,headings)});
   }
-  for(const q of (doc.reviewerData?.questions||[])){if(cards.length>=48)break;const u=units.find(x=>x.page===q.page)||units[0];add('study-question',q.q,u?.text||'Review the source and explain the concept.','',u?.page,u?.source||'page');}
-  for(const m of (doc.media||[])){if(cards.length>=50)break;const ans=m.caption||m.ocrText||'Study the visual carefully and identify the main information it communicates.';add('photo',`What should you remember from the photo "${m.name}"?`,ans,'',null,'photo');if(m.ocrText)add('photo-ocr',`What important text can you recall from photo "${m.name}"?`,m.ocrText,'',null,'photo');}
-  for(const u of units){if(cards.length>=50)break;if((u.text||'').length<60)continue;add('main-idea','What is the main idea of this passage?',u.text,'',u.page,u.source||'page');}
-  return cards.slice(0,50);
+  const blueprint=[
+    {label:"Definitions",value:s.definitions.map(d=>d.term)},
+    {label:"Processes / steps",value:s.processes.slice(0,5).map(x=>x.text)},
+    {label:"Cause & effect",value:s.causes.slice(0,5).map(x=>x.text)},
+    {label:"Comparisons",value:s.comparisons.slice(0,5).map(x=>x.text)},
+    {label:"Examples",value:s.examples.slice(0,5).map(x=>x.text)},
+    {label:"Facts / formulas",value:s.facts.slice(0,6).map(x=>x.text)}
+  ];
+  const conceptMap=[];
+  for(let i=0;i<Math.min(terms.length,18);i++)for(let j=i+1;j<Math.min(terms.length,18);j++){
+    const a=terms[i],b=terms[j];const co=units.filter(u=>u.text.toLowerCase().includes(a.toLowerCase())&&u.text.toLowerCase().includes(b.toLowerCase())).length;if(co>=2)conceptMap.push({from:a,to:b,strength:co});
+  }
+  conceptMap.sort((a,b)=>b.strength-a.strength);
+  const strategy=buildStrategy(s,terms,doc.media||[],doc.summaryMode||"standard");
+  const examCram=synthesizeSummary(units,terms,headings,"cram");
+  const confidence=Math.round(clamp((Math.min(1,units.length/20)*.25)+(Math.min(1,terms.length/20)*.25)+(Math.min(1,s.definitions.length/6)*.20)+(Math.min(1,takeaways.length/8)*.20)+(headings.length?0.10:0),0,1)*100);
+  return {
+    engineVersion:REVIEW_ENGINE_VERSION,mode:doc.summaryMode||"standard",overview,strategy,examCram,terms,headings,
+    definitions:s.definitions,keyPoints:takeaways,processes:s.processes,causes:s.causes,comparisons:s.comparisons,examples:s.examples,facts:s.facts,
+    questions:questions.slice(0,28),memory,checklist:checklist.slice(0,24),pages:pages.slice(0,80),blueprint,conceptMap:conceptMap.slice(0,40),confidence
+  };
 }
-function shuffle(arr){const a=[...arr];for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
+
+function buildStrategy(s,terms,media,mode){
+  const pieces=[];
+  pieces.push(`Start with the ${Math.min(terms.length,12)} highest-value concepts, then use the ${SUMMARY_MODES[mode]?.label||"Standard"} summary as your first pass.`);
+  if(s.definitions.length)pieces.push("Master the definitions before memorizing examples.");
+  if(s.processes.length)pieces.push("Reconstruct the process steps from memory, then check the source order.");
+  if(s.causes.length)pieces.push("Practice explaining why each cause leads to its stated effect.");
+  if(s.comparisons.length)pieces.push("Make a two-column comparison for the ideas that are easy to confuse.");
+  if(s.facts.length)pieces.push("Memorize formulas, numbers, units, and thresholds separately from concepts.");
+  if(media.length)pieces.push("Study each photo/diagram as a visual cue, then explain it without looking.");
+  pieces.push("Finish with the quiz and revisit any concept you miss twice.");
+  return pieces.join(" ");
+}
+
+function clozeFromSentence(text,term){
+  const e=escapeRegExp(term);const re=new RegExp(`\\b${e}\\b`,'i');
+  return re.test(text)?text.replace(re,"_____ ").replace(/\s+$/,''):text;
+}
+
+function cardId(doc,type,question,answer){return stableId("fc",`${doc.id}|${type}|${question}|${answer}`);}
+function makeFlashcards(doc){
+  const units=sentenceUnits(doc),r=doc.reviewerData||buildReviewer(doc),cards=[],seen=new Set();
+  const add=(type,q,a,term="",page=null,source="page")=>{q=normalize(q);a=normalize(a);if(q.length<8||a.length<3)return;const id=cardId(doc,type,q,a);if(seen.has(id))return;seen.add(id);cards.push({id,type,term,question:q,answer:a,page,source});};
+  for(const d of r.definitions){add("definition",`What is ${d.term}?`,d.definition,d.term,d.page);add("explain",`Explain ${d.term} in simple words.`,d.definition,d.term,d.page);}
+  for(const p of r.processes.slice(0,12))add("process",`What process or sequence is described here?`,`Explain the sequence in this source statement: ${p.text}`,"",p.page);
+  for(const p of r.causes.slice(0,10))add("cause-effect",`What cause leads to what effect in this material?`,p.text,"",p.page);
+  for(const p of r.comparisons.slice(0,8))add("compare",`What ideas are being compared in this statement?`,p.text,"",p.page);
+  for(const f of r.facts.slice(0,10))add("fact",`What important fact, number, unit, or formula should you remember?`,f.text,"",f.page);
+  for(const term of r.terms.slice(0,24)){
+    const u=units.find(x=>x.text.toLowerCase().includes(term.toLowerCase()));if(!u)continue;
+    add("cloze",`Complete the statement:\n${clozeFromSentence(u.text,term)}`,term,term,u.page);
+    add("recall",`What does ${term} do, describe, or relate to in this material?`,u.text,term,u.page);
+  }
+  for(const q of r.questions.slice(0,18)){const u=units.find(x=>Number(x.page)===Number(q.page))||units[0];add("exam-recall",q.q,u?.text||q.q,"",q.page);}
+  for(const m of doc.media||[]){const answer=m.caption||m.ocrText;if(answer)add("visual",`What should you remember from ${m.name}?`,answer,"",null,"photo");}
+  if(cards.length<24)for(const p of r.keyPoints){add("key-point","What is the most important idea in this passage?",p.text,"",p.page);if(cards.length>=36)break;}
+  return cards.slice(0,60);
+}
+
+function deterministicShuffle(arr,seedText=""){
+  const a=[...arr];let seed=0;for(const c of seedText)seed=(seed*31+c.charCodeAt(0))>>>0;
+  for(let i=a.length-1;i>0;i--){seed=(Math.imul(seed,1664525)+1013904223)>>>0;const j=seed%(i+1);[a[i],a[j]]=[a[j],a[i]];}return a;
+}
+
+function quizItem(doc,type,question,context,correct,options,page){
+  const unique=[...new Set(options.filter(Boolean))];if(!unique.includes(correct))unique.unshift(correct);const opts=deterministicShuffle(unique.slice(0,4),question+correct);return opts.length>=2?{id:stableId("q",`${doc.id}|${type}|${question}|${correct}`),type,question,context,options:opts,correctIndex:opts.indexOf(correct),correct,page}:null;
+}
+
 function makeQuiz(doc){
-  const units=doc.units||[],defs=doc.reviewerData?.definitions||[],terms=doc.terms||[],points=doc.reviewerData?.keyPoints||[],quiz=[],seen=new Set();
-  const make=(question,context,correct,options,page,type)=>{const key=`${question}|${correct}|${page}`;if(seen.has(key))return;seen.add(key);const opts=shuffle([...new Set(options)]).slice(0,4);if(!opts.includes(correct))opts.unshift(correct);if(opts.length<2)return;quiz.push({id:stableId('q',`${doc.id}|${key}`),question,context,options:opts,correctIndex:opts.indexOf(correct),correct,page,type});};
-  for(const d of defs){const wrong=shuffle(terms.filter(t=>t.toLowerCase()!==d.term.toLowerCase())).slice(0,3);make(`Which concept is best described by this explanation?`,d.definition,d.term,[d.term,...wrong],d.page,'definition');if(quiz.length>=8)break;}
-  for(const term of terms){const u=contextForTerm(term,units);if(!u)continue;const wrong=shuffle(terms.filter(t=>t!==term)).slice(0,3);make(`Which term best completes the statement?`,u.text,term,[term,...wrong],u.page,'concept');if(quiz.length>=14)break;}
-  for(const p of points){if(quiz.length>=20)break;const wrong=shuffle(points.filter(x=>x.text!==p.text).map(x=>x.text)).slice(0,3);make(`Which statement matches the key point being tested?`,p.text,p.text,[p.text,...wrong],p.page,'key-point');}
-  for(const m of (doc.media||[])){if(quiz.length>=20)break;const answer=m.caption||m.ocrText;if(answer){const wrong=shuffle((doc.reviewerData?.memory||[]).map(x=>x.clue).filter(Boolean)).slice(0,3);make(`Which statement best matches photo "${m.name}"?`,answer,answer,[answer,...wrong],null,'photo');}}
-  return quiz.slice(0,20);
+  const r=doc.reviewerData||buildReviewer(doc),terms=r.terms||[],quiz=[],seen=new Set();const add=q=>{if(q&&!seen.has(q.id)){seen.add(q.id);quiz.push(q);}};
+  for(const d of (r.definitions||[])){
+    const wrong=deterministicShuffle(terms.filter(t=>t.toLowerCase()!==d.term.toLowerCase()),d.term).slice(0,3);
+    add(quizItem(doc,"definition",`Which concept is best described by the definition below?`,d.definition,d.term,[d.term,...wrong],d.page));
+    if(quiz.length>=8)break;
+  }
+  for(const term of terms){
+    if(quiz.length>=14)break;
+    const u=sentenceUnits(doc).find(x=>x.text.toLowerCase().includes(term.toLowerCase()));if(!u)continue;
+    const wrong=deterministicShuffle(terms.filter(t=>t!==term),term).slice(0,3);
+    add(quizItem(doc,"concept","Which term is most directly supported by this source statement?",u.text,term,[term,...wrong],u.page));
+  }
+  for(const p of (r.keyPoints||[])){
+    if(quiz.length>=20)break;
+    const wrong=deterministicShuffle((r.keyPoints||[]).filter(x=>x.text!==p.text).map(x=>x.text),p.text).slice(0,3);
+    add(quizItem(doc,"key-point","Which statement best matches the source material?",p.text,p.text,[p.text,...wrong],p.page));
+  }
+  for(const m of doc.media||[]){
+    if(quiz.length>=24)break;
+    const correct=m.caption||m.ocrText;if(!correct)continue;
+    const wrong=deterministicShuffle((r.memory||[]).map(x=>x.clue).filter(Boolean),m.name).slice(0,3);
+    add(quizItem(doc,"visual",`Which statement best matches ${m.name}?`,correct,correct,[correct,...wrong],null));
+  }
+  return quiz.slice(0,24);
+}
+
+function reviewerText(doc){
+  const r=doc.reviewerData||buildReviewer(doc);
+  const sec=(title,lines)=>`${title}\n${lines?.length?lines.map((x,i)=>`${i+1}. ${typeof x==="string"?x:x.text||x.definition||x.q||JSON.stringify(x)}`).join("\n"):'—'}`;
+  return [
+    `STUDYVAULT REVIEWER — ${doc.fileName}`,
+    `SUMMARY MODE: ${SUMMARY_MODES[r.mode]?.label||r.mode}`,
+    `SOURCE CONFIDENCE: ${r.confidence||0}%`,
+    `\nEXECUTIVE SUMMARY\n${r.overview}`,
+    doc.ai?.reviewer?`\nLOCAL AI REVIEW\n${doc.ai.reviewer}`:"",
+    `\nEXAM CRAM\n${r.examCram}`,
+    `\nHOW TO STUDY\n${r.strategy}`,
+    sec("\nKEY TERMS",r.terms),
+    sec("\nDEFINITIONS",r.definitions.map(d=>`${d.term}: ${d.definition}${d.page?` (Page ${d.page})`:""}`)),
+    sec("\nKEY POINTS",r.keyPoints),
+    sec("\nPROCESSES / STEPS",r.processes),
+    sec("\nCAUSE & EFFECT",r.causes),
+    sec("\nCOMPARISONS",r.comparisons),
+    sec("\nEXAMPLES",r.examples),
+    sec("\nFACTS / FORMULAS",r.facts),
+    sec("\nMEMORY CUES",r.memory),
+    sec("\nSTUDY QUESTIONS",r.questions.map(q=>q.q)),
+    sec("\nEXAM CHECKLIST",r.checklist),
+    sec("\nPAGE HIGHLIGHTS",r.pages.map(p=>`Page ${p.page}: ${p.text}`))
+  ].join("\n\n");
+}
+
+function regenerateDoc(doc,resetProgress=false){
+  doc.terms=candidateTerms(doc);
+  doc.reviewerData=buildReviewer(doc);
+  doc.reviewerText=reviewerText(doc);
+  doc.flashcards=makeFlashcards(doc);
+  doc.quiz=makeQuiz(doc);
+  doc.currentCard=0;
+  doc.knownCardIds=Array.isArray(doc.knownCardIds)?doc.knownCardIds.filter(id=>doc.flashcards.some(c=>c.id===id)):[];
+  doc.cardStats=doc.cardStats&&typeof doc.cardStats==="object"?doc.cardStats:{};
+  if(resetProgress){doc.knownCardIds=[];doc.cardStats={};doc.quizScore=null;doc.quizHistory=[];}
+  doc.reviewerVersion=REVIEW_ENGINE_VERSION;
+}
+
+function scheduleAIForDoc(doc){if(!state.settings.ai?.enabled||!window.StudyVaultAI)return;setTimeout(async()=>{try{const ai=await window.StudyVaultAI.enhanceDocument(doc,learnerProfile(),{progress:m=>{const el=$("#aiStatus");if(el)el.textContent=m.message||"Local AI working…";}});doc.ai={...(doc.ai||{}),...ai};if(ai.reviewer&&doc.reviewerData)doc.reviewerData.aiReviewer=ai.reviewer;await saveDoc(doc);renderAll();}catch(e){console.warn("AI enhancement skipped",e);}},80);}
+
+async function renderPdfPageForOcr(page,scale=1.55){
+  const viewport=page.getViewport({scale});
+  const canvas=document.createElement("canvas");canvas.width=Math.ceil(viewport.width);canvas.height=Math.ceil(viewport.height);
+  const ctx=canvas.getContext("2d",{alpha:false});await page.render({canvasContext:ctx,viewport}).promise;
+  return new Promise((resolve,reject)=>canvas.toBlob(blob=>blob?resolve(blob):reject(new Error("Could not render PDF page for OCR.")),"image/jpeg",.82));
 }
 async function extractPdf(file,progress){
   const ready=await loadPdfEngine();
@@ -363,57 +606,82 @@ async function extractPdf(file,progress){
     const items=content.items.filter(x=>typeof x.str==="string"&&x.str.trim());
     items.sort((a,b)=>{const ay=a.transform?.[5]||0,by=b.transform?.[5]||0;if(Math.abs(by-ay)>3)return by-ay;return (a.transform?.[4]||0)-(b.transform?.[4]||0)});
     const lines=[];let current="";let lastY=null;
-    for(const item of items){
-      const y=item.transform?.[5]||0;
-      if(lastY!==null&&Math.abs(y-lastY)>3){if(current.trim())lines.push(current.trim());current="";}
-      current+=`${current?" ":""}${item.str.trim()}`;lastY=y;
-    }
+    for(const item of items){const y=item.transform?.[5]||0;if(lastY!==null&&Math.abs(y-lastY)>3){if(current.trim())lines.push(current.trim());current="";}current+=`${current?" ":""}${item.str.trim()}`;lastY=y;}
     if(current.trim())lines.push(current.trim());
-    const text=normalize(lines.join("\n"));
-    pageTexts.push({page:pageNumber,text});
-    for(const s of extractSentences(text,24))units.push({page:pageNumber,text:s});
+    const text=normalize(lines.join("\n"));pageTexts.push({page:pageNumber,text});
+    for(const x of extractSentences(text,24))units.push({page:pageNumber,text:x});
     progress?.(pageNumber,pdf.numPages);
   }
-  return {pageCount:pdf.numPages,pageTexts,units,rawText:pageTexts.map(p=>`Page ${p.page}\n${p.text}`).join("\n\n")};
+  let rawText=pageTexts.map(p=>`Page ${p.page}\n${p.text}`).join("\n\n");
+  if(wordCount(rawText)<20){
+    const readyOcr=await loadTesseract();
+    if(readyOcr){
+      for(let pageNumber=1;pageNumber<=pdf.numPages;pageNumber++){
+        const page=await pdf.getPage(pageNumber);
+        progress?.(`ocr:${pageNumber}`,pdf.numPages);
+        try{
+          const blob=await renderPdfPageForOcr(page);const ocr=await ocrImage(new File([blob],`${file.name}-page-${pageNumber}.jpg`,{type:"image/jpeg"}));
+          if(ocr.text){pageTexts[pageNumber-1].text=ocr.text;pageTexts[pageNumber-1].source="ocr";for(const x of extractSentences(ocr.text,18))units.push({page:pageNumber,text:x,source:"ocr"});}
+        }catch(err){console.warn("Scanned PDF OCR failed on page",pageNumber,err);}
+      }
+      rawText=pageTexts.map(p=>`Page ${p.page}\n${p.text}`).join("\n\n");
+    }
+  }
+  return {pageCount:pdf.numPages,pageTexts,units,rawText};
 }
 
+function plainToHtml(text){
+  return normalize(text).split(/\n\n+/).map(p=>`<p>${esc(p).replace(/\n/g,"<br>")}</p>`).join("")||"<p></p>";
+}
+function stripHtml(html){
+  const box=document.createElement("div");box.innerHTML=html||"";
+  return normalize(box.innerText||box.textContent||"");
+}
+function safeNoteHtml(html){
+  const box=document.createElement("div");box.innerHTML=String(html||"");
+  const allowed=new Set(["P","DIV","BR","STRONG","B","EM","I","U","H2","H3","UL","OL","LI","BLOCKQUOTE","IMG","A","SPAN"]);
+  const safeImage=/^data:image\/(png|jpeg|webp|gif);base64,[a-z0-9+/=]+$/i;
+  const safeHref=/^(https?:|mailto:)/i;
+  box.querySelectorAll("*").forEach(el=>{
+    if(!allowed.has(el.tagName)){el.replaceWith(...el.childNodes);return;}
+    [...el.attributes].forEach(attr=>{
+      const n=attr.name.toLowerCase(),v=attr.value||"";
+      if(n.startsWith("on")||n==="style"||n==="srcdoc"||n==="formaction"||n==="xlink:href"){el.removeAttribute(attr.name);return;}
+      if(el.tagName==="IMG"&&n==="src"&&!safeImage.test(v)){el.removeAttribute(attr.name);return;}
+      if(el.tagName==="A"&&n==="href"&&!safeHref.test(v)){el.removeAttribute(attr.name);return;}
+      if(el.tagName==="A"&&n==="target")el.setAttribute("rel","noopener noreferrer");
+      if(!["src","alt","href","target","rel"].includes(n))el.removeAttribute(attr.name);
+    });
+  });
+  return box.innerHTML||"<p></p>";
+}
+function migrateCardStats(d){
+  const out=typeof d.cardStats==="object"&&d.cardStats?{...d.cardStats}:{};
+  for(const c of d.flashcards||[]){
+    const s=out[c.id]; if(!s)out[c.id]={attempts:0,correct:0,streak:0,ease:2.5,dueAt:0,lastSeen:0};
+  }
+  return out;
+}
 function normalizeDoc(raw){
   const d={...raw};
-  d.id=d.id||uid();
-  d.sourceType=d.sourceType||"pdf";
-  d.fileName=String(d.fileName||"Untitled Study Material");
-  d.pageCount=Number(d.pageCount)||0;
-  d.media=Array.isArray(d.media)?d.media:[];
-  d.pageTexts=Array.isArray(d.pageTexts)?d.pageTexts:[];
+  d.id=d.id||uid();d.sourceType=d.sourceType||"pdf";d.ai=typeof d.ai==="object"&&d.ai?d.ai:{enabled:false,generatedAt:"",reviewer:"",cards:[],quiz:[],groundingScore:0};d.fileName=String(d.fileName||"Untitled Study Material");
+  d.pageCount=Number(d.pageCount)||0;d.media=Array.isArray(d.media)?d.media:[];d.pageTexts=Array.isArray(d.pageTexts)?d.pageTexts:[];
   d.rawText=String(d.rawText||d.pageTexts.map(p=>p.text||"").join("\n\n"));
-  d.units=Array.isArray(d.units)?d.units:d.pageTexts.flatMap(p=>extractSentences(p.text||"").map(text=>({page:p.page,text})));
-  d.terms=Array.isArray(d.terms)&&d.terms.length?d.terms:extractTerms(d.rawText);
-  d.reviewerData=d.reviewerData||buildReviewer(d);
-  d.reviewerText=d.reviewerText||buildReviewerText(d);
-  d.flashcards=Array.isArray(d.flashcards)&&d.flashcards.length?d.flashcards:makeFlashcards(d);
-  d.flashcards=d.flashcards.map((c,i)=>({...c,id:c.id||stableId("fc",`${d.id}|${i}|${c.question||""}|${c.answer||""}`)}));
+  d.units=Array.isArray(d.units)&&d.units.length?d.units:sentenceUnits(d);
+  d.summaryMode=SUMMARY_MODES[d.summaryMode]?d.summaryMode:"standard";
+  d.terms=candidateTerms(d);
+  if(!d.reviewerData||d.reviewerData.engineVersion!==REVIEW_ENGINE_VERSION||d.reviewerData.mode!==d.summaryMode){regenerateDoc(d,false);}
+  d.reviewerText=reviewerText(d);
+  d.flashcards=Array.isArray(d.flashcards)?d.flashcards:makeFlashcards(d);d.flashcards=d.flashcards.map((c,i)=>({...c,id:c.id||cardId(d,c.type||"recall",c.question||`Card ${i+1}`,c.answer||"")}));
   d.currentCard=clamp(Number(d.currentCard)||0,0,Math.max(0,d.flashcards.length-1));
   d.knownCardIds=Array.isArray(d.knownCardIds)?d.knownCardIds.filter(id=>d.flashcards.some(c=>c.id===id)):[];
+  d.cardStats=migrateCardStats(d);
   d.quiz=Array.isArray(d.quiz)&&d.quiz.length?d.quiz:makeQuiz(d);
-  d.quiz=d.quiz.map((q,i)=>{const options=Array.isArray(q.options)?q.options:[];const ci=Number.isInteger(q.correctIndex)?q.correctIndex:options.indexOf(q.correct);return {...q,id:q.id||stableId("q",`${d.id}|${i}|${q.question||""}`),options,correctIndex:clamp(ci>=0?ci:0,0,Math.max(0,options.length-1)),correct:options[ci>=0?ci:0]||q.correct||""};});
-  d.quizHistory=Array.isArray(d.quizHistory)?d.quizHistory:[];
-  d.quizScore=Number.isFinite(d.quizScore)?d.quizScore:null;
-  d.notesTitle=String(d.notesTitle||"Study Notes");
-  d.notesHtml=safeNoteHtml(d.notesHtml||plainToHtml(String(d.notes||"")));
-  d.notes=stripHtml(d.notesHtml);
-  d.notesUpdatedAt=d.notesUpdatedAt||"";
+  d.quiz=d.quiz.map((q,i)=>{const options=Array.isArray(q.options)?q.options:[];let ci=Number.isInteger(q.correctIndex)?q.correctIndex:options.indexOf(q.correct);ci=ci>=0?ci:0;return {...q,id:q.id||stableId("q",`${d.id}|${i}|${q.question||""}`),options,correctIndex:clamp(ci,0,Math.max(0,options.length-1)),correct:options[ci]||q.correct||""};});
+  d.quizHistory=Array.isArray(d.quizHistory)?d.quizHistory:[];d.quizScore=Number.isFinite(d.quizScore)?d.quizScore:null;
+  d.notesTitle=String(d.notesTitle||"Study Notes");d.notesHtml=safeNoteHtml(d.notesHtml||plainToHtml(String(d.notes||"")));d.notes=stripHtml(d.notesHtml);d.notesUpdatedAt=d.notesUpdatedAt||"";
   d.createdAt=d.createdAt||now();d.updatedAt=d.updatedAt||now();
   return d;
-}
-function plainToHtml(text){return normalize(text).split(/\n\n+/).map(p=>`<p>${esc(p).replace(/\n/g,"<br>")}</p>`).join("")||"<p></p>";}
-function stripHtml(html){const box=document.createElement("div");box.innerHTML=html||"";return normalize(box.innerText||box.textContent||"");}
-function safeNoteHtml(html){const box=document.createElement('div');box.innerHTML=String(html||'');const allowed=new Set(['P','DIV','BR','STRONG','B','EM','I','U','H2','H3','UL','OL','LI','BLOCKQUOTE','IMG','A','SPAN']);box.querySelectorAll('*').forEach(el=>{if(!allowed.has(el.tagName)){el.replaceWith(...el.childNodes);return;}[...el.attributes].forEach(a=>{const n=a.name.toLowerCase(),v=a.value||'';if(n.startsWith('on'))el.removeAttribute(a.name);else if(el.tagName==='IMG'&&n==='src'&&!/^data:image\/(png|jpeg|webp|gif);base64,/i.test(v))el.removeAttribute(a.name);else if(el.tagName==='A'&&n==='href'&&!/^(https?:|mailto:)/i.test(v))el.removeAttribute(a.name);else if(!['src','alt','href','target','rel'].includes(n))el.removeAttribute(a.name);});});return box.innerHTML||'<p></p>';}
-
-function buildReviewerText(doc){const r=doc.reviewerData||buildReviewer(doc);return [`STUDY REVIEWER\n${doc.fileName}`,`AT A GLANCE\n${r.overview}`,`STUDY STRATEGY\n${r.strategy}`,`KEY TERMS\n${(doc.terms||[]).map((t,i)=>`${i+1}. ${t}`).join('\n')}`,`DEFINITIONS & EXPLANATIONS\n${r.definitions.map(d=>`${d.term}: ${d.definition}${d.page?` (Page ${d.page})`:''}`).join('\n\n')||'No clean definitions detected.'}`,`KEY POINTS\n${r.keyPoints.map((k,i)=>`${i+1}. ${k.text}${k.page?` (Page ${k.page})`:''}`).join('\n\n')}`,`MEMORY CUES\n${(r.memory||[]).map((m,i)=>`${i+1}. ${m.term}: ${m.clue}`).join('\n')}`,`EXAM CHECKLIST\n${(r.checklist||[]).map((x,i)=>`${i+1}. ${x}`).join('\n')}`,`STUDY QUESTIONS\n${r.questions.map((q,i)=>`${i+1}. ${typeof q==='string'?q:q.q}`).join('\n')}`,`PAGE HIGHLIGHTS\n${r.pages.map(p=>`Page ${p.page}: ${p.text}`).join('\n\n')}`,`VISUAL MATERIAL\n${(doc.media||[]).map((m,i)=>`Photo ${i+1}: ${m.name}${m.caption?` — ${m.caption}`:''}${m.ocrText?`\nOCR: ${m.ocrText.slice(0,700)}`:''}`).join('\n\n')||'No photos.'}`].join('\n\n');}
-
-function regenerateDoc(doc,resetProgress=false){
-  doc.terms=extractTerms(doc.rawText);doc.reviewerData=buildReviewer(doc);doc.reviewerText=buildReviewerText(doc);doc.flashcards=makeFlashcards(doc);doc.quiz=makeQuiz(doc);doc.currentCard=0;
-  if(resetProgress){doc.knownCardIds=[];doc.quizScore=null;}
 }
 
 function renderLibrary(){
@@ -427,27 +695,44 @@ function renderStats(){const docs=state.documents;$("#stats").classList.toggle('
 function renderActivePanel(){const d=activeDoc(),box=$("#activeDocPanel");if(!d){box.innerHTML='<div class="empty">Add a PDF or photo to start studying.</div>';return;}const known=d.knownCardIds.length,total=d.flashcards.length,progress=total?Math.round(known/total*100):0;box.innerHTML=`<div class="doc" style="margin-bottom:12px"><div class="doc-icon">${d.sourceType==='image'?'🖼':'📘'}</div><div class="doc-main"><div class="doc-name">${esc(d.fileName)}</div><div class="doc-meta">${d.sourceType==='image'?'Photo study':'PDF'} • ${d.pageCount||1} page${(d.pageCount||1)===1?'':'s'} • ${d.media?.length||0} photo(s) • ${wordCount(d.rawText||'').toLocaleString()} words</div></div></div><div class="source-pill">${d.sourceType==='image'?'OCR + Visual':'PDF text + page structure'}</div><p class="muted" style="line-height:1.65;margin-top:12px">${esc(d.reviewerData?.overview||'')}</p><div style="margin-top:14px"><div style="display:flex;justify-content:space-between;gap:10px;font-size:.75rem;color:var(--muted)"><span>Flashcard progress</span><span>${known}/${total} (${progress}%)</span></div><div class="progress-track" style="margin-top:6px"><div class="progress-bar" style="width:${progress}%"></div></div></div><div class="row" style="margin-top:14px"><button class="btn primary small" data-go="reviewer">Reviewer</button><button class="btn secondary small" data-go="flashcards">Flashcards</button><button class="btn secondary small" data-go="quiz">Quiz</button><button id="regenDocBtn" class="btn warning small">Regenerate</button></div>`;box.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>activateSection(b.dataset.go));$("#regenDocBtn").onclick=async()=>{regenerateDoc(d,true);await saveDoc(d);renderAll();toast('Reviewer, flashcards, and quiz regenerated.','success');};}
 function renderTerms(){const c=$("#reviewerTerms"),terms=activeDoc()?.terms||[];c.innerHTML=terms.length?terms.map(t=>`<span class="term">${esc(t)}</span>`).join(''):'<div class="empty">No terms detected.</div>';}
 function renderReviewer(){
-  const d=activeDoc(),r=d?.reviewerData;$("#reviewerOverview").textContent=r?.overview||'Select a study material.';$("#reviewerStrategy").textContent=r?.strategy||'Add a PDF or photo to create a study strategy.';renderTerms();
-  const defs=$("#reviewerDefinitions");defs.innerHTML=r?.definitions?.length?r.definitions.map(x=>`<div class="definition-card"><strong>${esc(x.term)}</strong><span>${esc(x.definition)}${x.page?` <span class="tiny">Page ${x.page}</span>`:''}</span></div>`).join(''):'<div class="empty">No clean definition sentence was detected. The reviewer still uses key points, memory cues, questions, and visual material.</div>';
-  const points=$("#reviewerKeyPoints");points.innerHTML=r?.keyPoints?.length?r.keyPoints.map(x=>`<li>${esc(x.text)}${x.page?`<span class="meta">Page ${x.page}</span>`:''}</li>`).join(''):'<li class="empty">No key points yet.</li>';
-  const qs=$("#reviewerQuestions");qs.innerHTML=r?.questions?.length?r.questions.map(q=>`<div class="study-question">${esc(typeof q==='string'?q:q.q)}${q?.page?` <span class="source-chip">Page ${q.page}</span>`:''}</div>`).join(''):'<div class="empty">No study questions yet.</div>';
-  const pages=$("#reviewerPages");pages.innerHTML=r?.pages?.length?r.pages.map(p=>`<li><strong>Page ${p.page}</strong><div style="margin-top:5px">${esc(p.text)}</div></li>`).join(''):'<li class="empty">No page highlights.</li>';
-  const mem=$("#reviewerMemory");mem.innerHTML=r?.memory?.length?r.memory.map(m=>`<div class="memory-item"><strong>${esc(m.term)}</strong><span>${esc(m.clue)}</span></div>`).join(''):'<div class="empty">No memory cues yet.</div>';
-  const checklist=$("#reviewerChecklist");checklist.innerHTML=r?.checklist?.length?r.checklist.map(x=>`<li>${esc(x)}</li>`).join(''):'<li class="empty">No checklist yet.</li>';
-  const photos=$("#reviewerPhotos"),media=d?.media||[];photos.innerHTML=media.length?media.map(m=>`<div class="photo-card"><img src="${m.dataUrl}" alt="${esc(m.name)}"><div class="photo-body"><div class="photo-name">${esc(m.name)}</div><div class="photo-meta">${m.confidence?`OCR confidence ${Math.round(m.confidence)}%`:'OCR text not available'}</div><div class="ocr-badge ${m.ocrText?'':'warn'}">${m.ocrText?'✓ OCR text available':'⚠ Add a caption'}</div><input class="photo-caption" data-caption="${esc(m.id)}" value="${esc(m.caption||'')}" maxlength="300" placeholder="What should you remember from this photo?"><div class="photo-actions"><button class="btn small secondary" data-insert-note="${esc(m.id)}">Insert in notes</button><button class="btn small danger" data-remove-photo="${esc(m.id)}">Remove</button></div></div></div>`).join(''):'<div class="photo-empty">No photos attached. Use Add Photos from Dashboard or add an image directly to Notes.</div>';
-  photos.querySelectorAll('[data-caption]').forEach(input=>input.addEventListener('change',async()=>{const m=d.media.find(x=>x.id===input.dataset.caption);if(!m)return;m.caption=input.value.trim();regenerateDoc(d,false);await saveDoc(d);renderAll();toast('Photo caption saved and study material regenerated.','success');}));
-  photos.querySelectorAll('[data-remove-photo]').forEach(b=>b.onclick=async()=>{const m=d.media.find(x=>x.id===b.dataset.removePhoto);if(!m)return;if(!confirm(`Remove ${m.name}?`))return;d.media=d.media.filter(x=>x.id!==m.id);d.pageTexts=d.pageTexts.filter(p=>p.photoId!==m.id);d.units=d.units.filter(u=>u.photoId!==m.id);regenerateDoc(d,true);await saveDoc(d);renderAll();toast('Photo removed.','success');});
-  photos.querySelectorAll('[data-insert-note]').forEach(b=>b.onclick=()=>{const m=d.media.find(x=>x.id===b.dataset.insertNote);if(!m)return;activateSection('notes');setTimeout(()=>insertAtCursor(`<p><img src="${m.dataUrl}" alt="${esc(m.name)}"><br><strong>${esc(m.name)}</strong></p>`),60);});
+  const d=activeDoc(),r=d?.reviewerData;
+  $("#reviewerOverview").textContent=r?.overview||"Select a study material.";
+  $("#reviewerCram").textContent=r?.examCram||"Upload a PDF or photo to create a compact exam summary.";
+  $("#reviewerStrategy").textContent=r?.strategy||"Upload a PDF to create a study strategy.";
+  $("#reviewerMeta").textContent=d?`${d.fileName} • ${r?.mode?SUMMARY_MODES[r.mode]?.label||r.mode:"Standard"} • ${r?.terms?.length||0} concepts • ${r?.confidence||0}% source-structure confidence`:`Evidence-first local synthesis. Change the summary depth without changing your source material.`;
+  $("#reviewerConfidence").textContent=d?`${r?.confidence||0}% evidence confidence`:`Not analyzed`;
+  $$('[data-summary-mode]').forEach(b=>b.classList.toggle("active",b.dataset.summaryMode===(d?.summaryMode||"standard")));
+  renderTerms();
+  const fill=(sel,items,map,empty)=>{const el=$(sel);if(!el)return;el.innerHTML=items?.length?items.map(map).join(""):empty;};
+  fill("#reviewerDefinitions",r?.definitions,d=>`<div class="definition-card"><strong>${esc(d.term)}</strong><span>${esc(d.definition)}${d.page?` <span class="tiny">Page ${d.page}</span>`:""}<span class="confidence-badge">${Math.round((d.confidence||0)*100)}%</span></span></div>`,'<div class="empty">No explicit definition pattern was detected. Contextual evidence is still available.</div>');
+  fill("#reviewerKeyPoints",r?.keyPoints,x=>`<li>${esc(x.text)}${x.heading?`<span class="meta">${esc(x.heading)}</span>`:""}${x.page?`<span class="meta">Page ${x.page}</span>`:""}</li>`,'<li class="empty">No strong evidence points yet.</li>');
+  fill("#reviewerProcesses",r?.processes,x=>`<li>${esc(x.text)}${x.page?`<span class="meta">Page ${x.page}</span>`:""}</li>`,'<li class="empty">No process or sequence pattern detected.</li>');
+  fill("#reviewerCauses",r?.causes,x=>`<li>${esc(x.text)}${x.page?`<span class="meta">Page ${x.page}</span>`:""}</li>`,'<li class="empty">No cause-effect pattern detected.</li>');
+  fill("#reviewerComparisons",r?.comparisons,x=>`<li>${esc(x.text)}${x.page?`<span class="meta">Page ${x.page}</span>`:""}</li>`,'<li class="empty">No comparison pattern detected.</li>');
+  fill("#reviewerExamples",r?.examples,x=>`<li>${esc(x.text)}${x.page?`<span class="meta">Page ${x.page}</span>`:""}</li>`,'<li class="empty">No example pattern detected.</li>');
+  fill("#reviewerFacts",r?.facts,x=>`<li>${esc(x.text)}${x.page?`<span class="meta">Page ${x.page}</span>`:""}</li>`,'<li class="empty">No fact or formula pattern detected.</li>');
+  fill("#reviewerQuestions",r?.questions,q=>`<div class="study-question"><span class="question-type">${esc(q.type||"recall")}</span><div>${esc(q.q)}</div>${q.page?`<span class="source-chip">Page ${q.page}</span>`:""}</div>`,'<div class="empty">No study questions yet.</div>');
+  fill("#reviewerPages",r?.pages,p=>`<li><strong>Page ${esc(p.page)}</strong>${p.heading?`<span class="meta">${esc(p.heading)}</span>`:""}<div style="margin-top:5px">${esc(p.text)}</div></li>`,'<li class="empty">No page evidence detected.</li>');
+  fill("#reviewerMemory",r?.memory,m=>`<div class="memory-item"><strong>${esc(m.term)}</strong><span>${esc(m.clue)}${m.page?` <span class="tiny">Page ${m.page}</span>`:""}</span></div>`,'<div class="empty">No memory cues yet.</div>');
+  fill("#reviewerChecklist",r?.checklist,x=>`<li>${esc(x)}</li>`,'<li class="empty">No checklist yet.</li>');
+  const map=$("#reviewerConceptMap");if(map)map.innerHTML=r?.conceptMap?.length?r.conceptMap.slice(0,24).map(x=>`<div class="concept-link"><span>${esc(x.from)}</span><span>↔</span><span>${esc(x.to)}</span><em>${x.strength}</em></div>`).join(""):'<div class="empty">No strong concept links yet.</div>';
+  const photos=$("#reviewerPhotos"),media=d?.media||[];
+  photos.innerHTML=media.length?media.map(m=>`<div class="photo-card"><img src="${m.dataUrl}" alt="${esc(m.name)}"><div class="photo-body"><div class="photo-name">${esc(m.name)}</div><div class="photo-meta">${m.confidence?`OCR confidence ${Math.round(m.confidence)}%`:'OCR text not available'}</div><div class="ocr-badge ${m.ocrText?'':'warn'}">${m.ocrText?'✓ OCR text available':'⚠ Add a caption'}</div><input class="photo-caption" data-caption="${esc(m.id)}" value="${esc(m.caption||"")}" maxlength="300" placeholder="What should you remember from this photo?"><div class="photo-actions"><button class="btn small secondary" data-insert-note="${esc(m.id)}">Insert in notes</button><button class="btn small danger" data-remove-photo="${esc(m.id)}">Remove</button></div></div></div>`).join(""):'<div class="photo-empty">No photos attached.</div>';
+  photos.querySelectorAll("[data-caption]").forEach(input=>input.addEventListener("change",async()=>{const m=d?.media.find(x=>x.id===input.dataset.caption);if(!m)return;m.caption=input.value.trim();regenerateDoc(d,false);await saveDoc(d);renderAll();toast("Photo caption saved and reviewer regenerated.","success");}));
+  photos.querySelectorAll("[data-remove-photo]").forEach(b=>b.onclick=async()=>{const m=d?.media.find(x=>x.id===b.dataset.removePhoto);if(!m)return;if(!confirm(`Remove ${m.name}?`))return;d.media=d.media.filter(x=>x.id!==m.id);d.pageTexts=d.pageTexts.filter(pg=>pg.photoId!==m.id);d.units=d.units.filter(u=>u.photoId!==m.id);regenerateDoc(d,true);await saveDoc(d);renderAll();toast("Photo removed.","success");});
+  photos.querySelectorAll("[data-insert-note]").forEach(b=>b.onclick=()=>{const m=d?.media.find(x=>x.id===b.dataset.insertNote);if(!m)return;activateSection("notes");setTimeout(()=>insertAtCursor(`<p><img src="${m.dataUrl}" alt="${esc(m.name)}"><br><strong>${esc(m.name)}</strong></p>`),60);});
 }
+async function setSummaryMode(mode){const d=activeDoc();if(!d||!SUMMARY_MODES[mode])return toast("Select a study material first.","error");d.summaryMode=mode;regenerateDoc(d,false);await saveDoc(d);renderAll();toast(`${SUMMARY_MODES[mode].label} summary generated.`,`success`);}
 function renderFlash(){
   const d=activeDoc();
-  if(!d||!d.flashcards.length){$("#flashPosition").textContent='Select a document.';$("#flashQuestion").textContent='Your flashcards will appear here.';$("#flashAnswer").classList.add('hidden');$("#flashStatus").textContent='NOT STARTED';$("#flashKnown").textContent='Unmarked';return;}
-  d.currentCard=clamp(d.currentCard||0,0,d.flashcards.length-1);
-  const c=d.flashcards[d.currentCard],known=d.knownCardIds.includes(c.id);
-  $("#flashPosition").textContent=`Card ${d.currentCard+1} of ${d.flashcards.length}${c.page?` • Page ${c.page}`:''}`;
+  if(!d||!d.flashcards.length){$("#flashPosition").textContent="Select a document.";$("#flashQuestion").textContent="Your flashcards will appear here.";$("#flashAnswer").classList.add("hidden");$("#flashStatus").textContent="NOT STARTED";$("#flashKnown").textContent="Unmarked";return;}
+  d.currentCard=clamp(Number(d.currentCard)||0,0,d.flashcards.length-1);
+  const c=d.flashcards[d.currentCard],stats=d.cardStats?.[c.id]||{attempts:0,correct:0,streak:0,ease:2.5,dueAt:0};
+  const known=d.knownCardIds.includes(c.id),due=stats.dueAt&&stats.dueAt<=Date.now(),mastery=stats.attempts?Math.round(stats.correct/stats.attempts*100):0;
+  $("#flashPosition").textContent=`Card ${d.currentCard+1} of ${d.flashcards.length}${c.page?` • Page ${c.page}`:""}${due&&!known?" • Due now":""}`;
   $("#flashStatus").textContent=`${String(c.type).toUpperCase()} • CARD ${d.currentCard+1}`;
-  $("#flashKnown").textContent=known?'✓ Known':'Unmarked';
-  $("#flashQuestion").textContent=c.question;$("#flashAnswer").textContent=c.answer;$("#flashAnswer").classList.add('hidden');$("#knowFlash").disabled=known;
+  $("#flashKnown").textContent=known?"✓ Known":stats.attempts?`${mastery}% mastery`:(due?"Due for review":"New");
+  $("#flashQuestion").textContent=c.question;$("#flashAnswer").textContent=c.answer;$("#flashAnswer").classList.add("hidden");$("#knowFlash").disabled=known;
 }
 function renderQuiz(){
   const d=activeDoc(),ctn=$("#quizContainer");
@@ -466,7 +751,7 @@ function renderNotes(){
   const d=activeDoc(), editor=$("#notesEditor"),title=$("#notesTitle");
   editor.contentEditable=!!d;editor.innerHTML=d?.notesHtml||'<p></p>';title.value=d?.notesTitle||'';title.disabled=!d;$("#notesDocLabel").textContent=d?`Notes for ${d.fileName}`:'Notes are stored per document.';$("#noteDocumentHint").textContent=d?d.fileName:'Select a PDF to begin.';$("#noteWordCount").textContent=`${wordCount(stripHtml(editor.innerHTML))} words`;$("#noteUpdatedAt").textContent=d?.notesUpdatedAt?`Saved ${new Date(d.notesUpdatedAt).toLocaleTimeString()}`:'Not saved yet';
 }
-function renderAll(){renderDashboard();renderReviewer();renderFlash();renderQuiz();renderNotes();applyTheme();}
+function renderAll(){renderDashboard();renderReviewer();renderFlash();renderQuiz();renderNotes();renderAI();applyTheme();}
 
 function escapeRegExp(text){return String(text).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
 function highlight(text,q){const safe=esc(text);if(!q)return safe;const e=escapeRegExp(q);return safe.replace(new RegExp(`(${e})`,'gi'),'<mark>$1</mark>');}
@@ -478,14 +763,40 @@ function searchActive(q){
 }
 async function insertImageFilesIntoNotes(files){for(const file of [...files].filter(f=>f.type.startsWith('image/'))){try{const visual=await dataUrlFromFile(file,1600,.84);insertAtCursor(`<p><img src="${visual.dataUrl}" alt="${esc(file.name)}"><br><em>${esc(file.name)}</em></p>`);}catch(e){toast(`${file.name}: ${e.message||'Could not add image.'}`,'error');}}}
 
+function getEditorRange(){
+  const editor=$("#notesEditor");const sel=window.getSelection();
+  if(!sel||!sel.rangeCount||!editor.contains(sel.anchorNode))return null;
+  return sel.getRangeAt(0);
+}
+function wrapSelection(tagName){
+  const range=getEditorRange();if(!range||range.collapsed)return false;
+  const node=document.createElement(tagName);
+  try{node.appendChild(range.extractContents());range.insertNode(node);range.selectNodeContents(node);}catch{const frag=range.cloneContents();node.appendChild(frag);range.deleteContents();range.insertNode(node);range.selectNodeContents(node);}
+  return true;
+}
+function formatSelectionBlock(tagName){
+  const editor=$("#notesEditor"),range=getEditorRange();if(!range)return false;
+  const container=(range.commonAncestorContainer.nodeType===1?range.commonAncestorContainer:range.commonAncestorContainer.parentElement)?.closest("p,div,h2,h3,blockquote,li");
+  if(container&&editor.contains(container)){const n=document.createElement(tagName);while(container.firstChild)n.appendChild(container.firstChild);container.replaceWith(n);return true;}
+  return wrapSelection(tagName);
+}
+function makeListFromSelection(){
+  const range=getEditorRange();if(!range||range.collapsed)return false;
+  const text=range.toString().split(/\n+/).map(x=>x.trim()).filter(Boolean);if(!text.length)return false;
+  const ul=document.createElement("ul");text.forEach(x=>{const li=document.createElement("li");li.textContent=x;ul.appendChild(li);});range.deleteContents();range.insertNode(ul);return true;
+}
 function selectNoteCommand(cmd,value){
-  const editor=$("#notesEditor");editor.focus();
-  if(cmd==="formatBlock")document.execCommand(cmd,false,`<${value}>`);else document.execCommand(cmd,false,null);
-  scheduleNoteSave();
+  const editor=$("#notesEditor");editor.focus();let changed=false;
+  if(cmd==="bold")changed=wrapSelection("strong");
+  else if(cmd==="italic")changed=wrapSelection("em");
+  else if(cmd==="formatBlock")changed=formatSelectionBlock(String(value||"p").toLowerCase()==="h3"?"h3":"h2");
+  else if(cmd==="insertUnorderedList")changed=makeListFromSelection();
+  if(!changed)toast("Select some note text first.","error");else scheduleNoteSave();
 }
 function insertAtCursor(html){
-  const editor=$("#notesEditor");editor.focus();
-  document.execCommand('insertHTML',false,html);scheduleNoteSave();
+  const editor=$("#notesEditor");editor.focus();const range=getEditorRange();
+  if(!range){editor.insertAdjacentHTML("beforeend",safeNoteHtml(html));scheduleNoteSave();return;}
+  const holder=document.createElement("div");holder.innerHTML=safeNoteHtml(html);const frag=document.createDocumentFragment();while(holder.firstChild)frag.appendChild(holder.firstChild);range.deleteContents();range.insertNode(frag);scheduleNoteSave();
 }
 function scheduleNoteSave(){
   const d=activeDoc();if(!d)return;
@@ -512,19 +823,76 @@ function downloadReviewer(){const d=activeDoc();if(!d)return toast('Select a doc
 async function submitQuiz(){
   const d=activeDoc();if(!d)return toast('Select a document first.','error');
   let score=0;
-  d.quiz.forEach((q,i)=>{const item=document.querySelector(`[data-q="${i}"]`),picked=document.querySelector(`input[name="q-${i}"]:checked`);if(!item)return;item.classList.remove('correct','wrong');if(picked&&Number(picked.value)===q.correctIndex){score++;item.classList.add('correct')}else item.classList.add('wrong');});
-  d.quizScore=score;d.quizHistory=d.quizHistory||[];const percent=d.quiz.length?Math.round(score/d.quiz.length*100):0;d.quizHistory.push({at:now(),score,total:d.quiz.length,percent});await saveDoc(d);
+  d.quiz.forEach((q,i)=>{const item=document.querySelector(`[data-q="${i}"]`),picked=document.querySelector(`input[name="q-${i}"]:checked`);if(!item)return;item.classList.remove('correct','wrong');const ok=!!picked&&Number(picked.value)===q.correctIndex;const concept=(d.terms||[]).find(t=>(q.context||q.question||'').toLowerCase().includes(String(t).toLowerCase()));if(concept)adaptConcept(concept,ok);if(ok){score++;item.classList.add('correct')}else item.classList.add('wrong');});
+  d.quizScore=score;d.quizHistory=d.quizHistory||[];const percent=d.quiz.length?Math.round(score/d.quiz.length*100):0;recordStudyResult([],percent/100);await saveMeta();d.quizHistory.push({at:now(),score,total:d.quiz.length,percent});await saveDoc(d);
   $("#quizResult").classList.remove('hidden');$("#quizResult").innerHTML=`<div class="score">${percent}%</div><p>You scored <strong>${score}/${d.quiz.length}</strong>.</p><p class="muted">Use the page numbers on missed questions to review the exact material before trying a new quiz.</p>`;renderQuizHistory(d);toast(`Quiz completed: ${score}/${d.quiz.length}.`,'success');
 }
 async function newQuiz(){const d=activeDoc();if(!d)return toast('Select a document first.','error');d.quiz=makeQuiz(d);d.quizScore=null;await saveDoc(d);renderQuiz();renderStats();toast('New quiz generated.','success');}
-async function moveFlash(delta){const d=activeDoc();if(!d?.flashcards.length)return;d.currentCard=(d.currentCard+delta+d.flashcards.length)%d.flashcards.length;await saveDoc(d);renderFlash();renderDashboard();}
-async function markKnown(known){const d=activeDoc();if(!d?.flashcards.length)return;const id=d.flashcards[d.currentCard].id;if(known&&!d.knownCardIds.includes(id))d.knownCardIds.push(id);if(!known)d.knownCardIds=d.knownCardIds.filter(x=>x!==id);await saveDoc(d);renderFlash();renderDashboard();}
+function nextSmartIndex(d,current,delta){
+  if(!d.flashcards.length)return 0;
+  if(delta<0)return (current-1+d.flashcards.length)%d.flashcards.length;
+  const nowMs=Date.now(),known=new Set(d.knownCardIds||[]),stats=d.cardStats||{};
+  const candidates=d.flashcards.map((c,i)=>{const st=stats[c.id]||{attempts:0,correct:0,streak:0,ease:2.5,dueAt:0};const due=st.dueAt&&st.dueAt<=nowMs;const weak=st.attempts?1-st.correct/st.attempts:.45;const cp=learnerProfile().concepts?.[normalize(c.term||"").toLowerCase()];const conceptWeak=cp?1-(cp.mastery||.35):.35;return {i,score:(due&&!known.has(c.id)?100:0)+weak*20+conceptWeak*28+(known.has(c.id)?-8:8)-Math.abs(i-current)*.01};}).filter(x=>x.i!==current).sort((a,b)=>b.score-a.score);
+  return candidates[0]?.i??((current+1)%d.flashcards.length);
+}
+async function moveFlash(delta){const d=activeDoc();if(!d?.flashcards.length)return;d.currentCard=nextSmartIndex(d,d.currentCard,delta);await saveDoc(d);renderFlash();renderDashboard();}
+async function markKnown(known){
+  const d=activeDoc();if(!d?.flashcards.length)return;const card=d.flashcards[d.currentCard],id=card.id;
+  d.cardStats=d.cardStats||{};const prev=d.cardStats[id]||{attempts:0,correct:0,streak:0,ease:2.5,dueAt:0};const next={...prev,attempts:prev.attempts+1,lastSeen:Date.now()};
+  if(known){next.correct=prev.correct+1;next.streak=prev.streak+1;next.ease=Math.min(3.2,prev.ease+.12);next.dueAt=Date.now()+Math.min(1000*60*60*24*21,1000*60*10*Math.pow(Math.max(1.4,next.ease),Math.min(6,next.streak)));if(!d.knownCardIds.includes(id))d.knownCardIds.push(id);}else{next.streak=0;next.ease=Math.max(1.3,prev.ease-.2);next.dueAt=Date.now()+1000*60*2;d.knownCardIds=d.knownCardIds.filter(x=>x!==id);}
+  d.cardStats[id]=next;adaptConcept(card.term||card.question,known);await saveDoc(d);await saveMeta();renderFlash();renderDashboard();renderAI();toast(known?"Marked known and scheduled for later review.":"Marked for review soon.",known?"success":"");}
+
+async function runLocalAIEnhancement(){
+  const d=activeDoc();if(!d)return toast("Select a study material first.","error");
+  if(!window.StudyVaultAI)return toast("Local AI module is unavailable.","error");
+  const status=$("#aiStatus"),btn=$("#aiEnhance");
+  if(btn)btn.disabled=true;if(status)status.textContent="Starting local AI…";
+  try{
+    const learner=learnerProfile();
+    const ai=await window.StudyVaultAI.enhanceDocument(d,learner,{progress:m=>{if(status)status.textContent=m.message||"Local AI working…";}});
+    d.ai={...(d.ai||{}),...ai};
+    if(ai.reviewer)d.reviewerData.aiReviewer=ai.reviewer;
+    if(ai.cards?.length){
+      const existing=new Set(d.flashcards.map(c=>normalize(c.question).toLowerCase()));
+      const extra=ai.cards.map(c=>({...c,id:stableId("ai-fc",`${d.id}|${c.question}|${c.answer}`)})).filter(c=>!existing.has(normalize(c.question).toLowerCase()));
+      d.flashcards=[...d.flashcards,...extra].slice(0,80);
+    }
+    if(ai.quiz?.length){
+      const existing=new Set(d.quiz.map(q=>normalize(q.question).toLowerCase()));
+      const extra=ai.quiz.map(q=>({...q,id:stableId("ai-q",`${d.id}|${q.question}`)})).filter(q=>q.options?.length>=3&&!existing.has(normalize(q.question).toLowerCase()));
+      d.quiz=[...d.quiz,...extra].slice(0,32);
+    }
+    await saveDoc(d);await saveMeta();renderAll();
+    if(status)status.textContent=`Local AI ready • grounded ${ai.groundingScore}% • ${ai.device}`;
+    toast("Local AI study upgrade completed.","success");
+  }catch(e){console.error(e);if(status)status.textContent="AI unavailable — deterministic reviewer kept";toast(e.message||"Local AI failed. Your existing reviewer was preserved.","error");}
+  finally{if(btn)btn.disabled=false;}
+}
+async function enableLocalAI(){
+  if(!window.StudyVaultAI)return toast("Local AI module is missing.","error");
+  const status=$("#aiStatus");if(status)status.textContent="Preparing local AI…";
+  try{await window.StudyVaultAI.load(m=>{if(status)status.textContent=m.message||"Loading local AI…";});state.settings.ai.enabled=true;await saveMeta();renderAll();toast("Local AI enabled. First setup may download and cache a model.","success");}
+  catch(e){state.settings.ai.enabled=false;await saveMeta();if(status)status.textContent="Not available on this browser/device";toast(e.message||"Local AI could not start.","error");}
+}
+async function disableLocalAI(){state.settings.ai.enabled=false;await saveMeta();renderAll();toast("Local AI disabled. The rule-based reviewer still works.");}
+function renderAI(){
+  const d=activeDoc(),ai=d?.ai||{},p=learnerProfile(),info=window.StudyVaultAI?.getRuntimeInfo?.()||{};
+  const status=$("#aiStatus");
+  if(status)status.textContent=ai.generatedAt?`AI reviewer saved • grounded ${ai.groundingScore||0}% • ${ai.device||"local"}`:(info.loaded?"Local AI loaded — ready to personalize this material.":"Local AI is optional. Enable it here or in Settings.");
+  const box=$("#aiReviewer");if(box)box.textContent=ai.reviewer||"No AI rewrite yet. The deterministic reviewer remains available below.";
+  const weak=$("#weakConcepts");if(weak){const ws=weakConcepts();weak.innerHTML=ws.length?ws.map(x=>`<span class="term">${esc(x)}</span>`).join(""):'<span class="tiny">Your weak areas appear after you study and answer questions.</span>';}
+  const entries=Object.values(p.concepts||{}),avg=entries.length?entries.reduce((sum,x)=>sum+(Number(x.mastery)||0),0)/entries.length:0;
+  const bar=$("#aiMasteryBar");if(bar)bar.style.width=`${Math.round(avg*100)}%`;
+  const mt=$("#aiMasteryText");if(mt)mt.textContent=entries.length?`Overall concept mastery: ${Math.round(avg*100)}% • ${p.sessions||0} sessions • streak ${p.streak||0}`:'No mastery data yet.';
+  const dev=$("#aiDevice");if(dev)dev.textContent=info.loaded?`${info.model} • ${info.device}`:`Model: on-device Qwen2.5 0.5B • ${navigator.gpu?"WebGPU available":"WASM fallback"}`;
+  const settingsInfo=$("#settingsAiInfo");if(settingsInfo)settingsInfo.textContent=info.loaded?`Loaded locally • ${info.device} • browser cache enabled when supported`:(state.settings.ai?.enabled?"AI enabled; load the model when needed.":"AI is optional; deterministic review works without it.");
+}
 
 function applyTheme(){document.body.classList.toggle('light',state.settings.theme==='light');}
 async function setTheme(theme){state.settings.theme=theme==='light'?'light':'dark';await saveMeta();applyTheme();toast(`${state.settings.theme==='light'?'Light':'Dark'} mode enabled.`,'success');}
 
 function exportBackup(){
-  const payload={app:'StudyVault',version:APP_VERSION,exportedAt:now(),settings:{theme:state.settings.theme},documents:state.documents};
+  const payload={app:'StudyVault',version:APP_VERSION,exportedAt:now(),settings:{theme:state.settings.theme,ai:{enabled:!!state.settings.ai?.enabled,model:state.settings.ai?.model||"onnx-community/Qwen2.5-0.5B-Instruct"},learner:learnerProfile()},documents:state.documents};
   downloadText(`studyvault-backup-${new Date().toISOString().slice(0,10)}.json`,JSON.stringify(payload,null,2));toast('Backup exported.','success');
 }
 async function importBackup(){
@@ -533,13 +901,16 @@ async function importBackup(){
     const data=JSON.parse(await file.text());if(data.app!=='StudyVault')throw new Error('Invalid StudyVault backup.');
     const incoming=Array.isArray(data.documents)?data.documents:(data.data?.fileName?[data.data]:null);if(!incoming)throw new Error('No StudyVault documents found in this backup.');
     for(const raw of incoming){const d=normalizeDoc(raw);await dbPut(DOC_STORE,d);}
-    state.documents=(await dbGetAll(DOC_STORE)).map(normalizeDoc);state.activeDocId=state.documents[0]?.id||null;state.settings.theme=data.settings?.theme==='light'?'light':'dark';await saveMeta();$("#importModal").classList.remove('open');$("#backupInput").value='';renderAll();toast('Backup imported.','success');
+    state.documents=(await dbGetAll(DOC_STORE)).map(normalizeDoc);state.activeDocId=state.documents[0]?.id||null;state.settings.theme=data.settings?.theme==='light'?'light':'dark';state.settings.learner={...defaultLearner(),...(data.settings?.learner||{})};state.settings.ai={...state.settings.ai,...(data.settings?.ai||{enabled:false})};await saveMeta();$("#importModal").classList.remove('open');$("#backupInput").value='';renderAll();toast('Backup imported.','success');
   }catch(e){console.error(e);toast(e.message||'Import failed.','error');}
 }
 async function resetAll(){if(!confirm('Delete ALL StudyVault data from this browser? This removes every document, note, quiz history, and PIN.'))return;await dbClear();location.reload();}
 
-function baseDoc(file,sourceType,extracted,media=[]){const doc={id:uid(),fileName:file.name,sourceType,pageCount:extracted.pageCount||0,pageTexts:extracted.pageTexts||[],units:extracted.units||[],rawText:extracted.rawText||'',terms:extractTerms(extracted.rawText||''),reviewerData:null,reviewerText:'',flashcards:[],currentCard:0,knownCardIds:[],notesTitle:'Study Notes',notesHtml:'<p></p>',notes:'',notesUpdatedAt:'',quiz:[],quizScore:null,quizHistory:[],media,createdAt:now(),updatedAt:now()};doc.reviewerData=buildReviewer(doc);doc.reviewerText=buildReviewerText(doc);doc.flashcards=makeFlashcards(doc);doc.quiz=makeQuiz(doc);return doc;}
-async function processPdfFiles(files){for(const file of [...files]){if(file.type!=='application/pdf'){toast(`${file.name}: not a PDF.`,'error');continue;}$("#upload").innerHTML=`<div class="loading"><span class="spinner"></span><span id="processStatus">Reading ${esc(file.name)}…</span></div>`;try{const extracted=await extractPdf(file,(page,total)=>{$("#processStatus").textContent=`Reading ${file.name} — page ${page} of ${total}…`;});if(wordCount(extracted.rawText)<20)throw new Error('This PDF has little or no selectable text. Use Add Photos/OCR for scanned pages.');const doc=baseDoc(file,'pdf',extracted,[]);state.documents.unshift(doc);state.activeDocId=doc.id;await dbPut(DOC_STORE,doc);await saveMeta();renderAll();toast(`${file.name} added and reviewer generated.`,'success');}catch(e){console.error(e);toast(`${file.name}: ${e.message||'Could not process PDF.'}`,'error');}}}
+function baseDoc(file,sourceType,extracted,media=[]){
+  const doc={id:uid(),fileName:file.name,sourceType,pageCount:extracted.pageCount||0,pageTexts:extracted.pageTexts||[],units:extracted.units||[],rawText:extracted.rawText||"",terms:[],reviewerData:null,reviewerText:"",summaryMode:"standard",flashcards:[],currentCard:0,knownCardIds:[],cardStats:{},notesTitle:"Study Notes",notesHtml:"<p></p>",notes:"",notesUpdatedAt:"",quiz:[],quizScore:null,quizHistory:[],ai:{enabled:false,generatedAt:"",reviewer:"",cards:[],quiz:[],groundingScore:0},media,createdAt:now(),updatedAt:now()};
+  regenerateDoc(doc,true);return doc;
+}
+async function processPdfFiles(files){for(const file of [...files]){if(file.type!=='application/pdf'){toast(`${file.name}: not a PDF.`,'error');continue;}$("#upload").innerHTML=`<div class="loading"><span class="spinner"></span><span id="processStatus">Reading ${esc(file.name)}…</span></div>`;try{const extracted=await extractPdf(file,(page,total)=>{$("#processStatus").textContent=String(page).startsWith("ocr:")?`OCR ${file.name} — page ${String(page).slice(4)} of ${total}…`:`Reading ${file.name} — page ${page} of ${total}…`;});if(wordCount(extracted.rawText)<20)throw new Error('This PDF has little or no selectable text. Use Add Photos/OCR for scanned pages.');const doc=baseDoc(file,'pdf',extracted,[]);state.documents.unshift(doc);state.activeDocId=doc.id;await dbPut(DOC_STORE,doc);await saveMeta();renderAll();toast(`${file.name} added and reviewer generated.`,'success');}catch(e){console.error(e);toast(`${file.name}: ${e.message||'Could not process PDF.'}`,'error');}}}
 async function processImageFiles(files){for(const file of [...files]){if(!/^image\/(png|jpeg|webp|bmp)$/.test(file.type)){toast(`${file.name}: unsupported image type.`,'error');continue;}$("#upload").innerHTML=`<div class="loading"><span class="spinner"></span><span id="processStatus">Preparing ${esc(file.name)}…</span></div>`;try{const visual=await dataUrlFromFile(file);let ocr={text:'',confidence:0};try{ocr=await ocrImage(file,m=>{$("#processStatus").textContent=`OCR ${file.name} — ${m.progress?Math.round(m.progress*100):0}%…`;});}catch(err){console.warn('OCR unavailable',err);toast(`${file.name}: photo saved, but OCR was unavailable. Add a caption on the Reviewer page.`,'error');}const mediaId=uid();const extracted={pageCount:1,pageTexts:[{page:1,text:ocr.text,source:'photo',photoId:mediaId}],units:extractSentences(ocr.text,18).map(text=>({page:1,text,source:'photo',photoId:mediaId})),rawText:ocr.text};const media=[{id:mediaId,name:file.name,dataUrl:visual.dataUrl,width:visual.width,height:visual.height,caption:'',ocrText:ocr.text,confidence:ocr.confidence,createdAt:now()}];const doc=baseDoc(file,'image',extracted,media);state.documents.unshift(doc);state.activeDocId=doc.id;await dbPut(DOC_STORE,doc);await saveMeta();renderAll();toast(`${file.name} added as a photo study sheet.`,'success');}catch(e){console.error(e);toast(`${file.name}: ${e.message||'Could not process photo.'}`,'error');}}}
 async function processFiles(files){const list=[...files].filter(Boolean);if(!list.length)return;const pdfs=list.filter(f=>f.type==='application/pdf'),images=list.filter(f=>f.type.startsWith('image/'));if(pdfs.length)await processPdfFiles(pdfs);if(images.length)await processImageFiles(images);$("#upload").innerHTML='<div><div class="upload-icon">📚</div><h3>Drop PDFs or study photos here</h3><p>Add PDFs, screenshots, and class photos. OCR can turn image text into reviewer material; visual cards keep the photo itself available for study.</p><div class="hero-actions" style="justify-content:center"><label for="pdfInput" class="btn primary">Choose PDFs</label><label for="imageInput" class="btn secondary">Choose Photos</label></div></div>';}
 
@@ -558,7 +929,10 @@ function bind(){
   $("#imageInput").addEventListener('change',e=>{processImageFiles(e.target.files);e.target.value='';});
   $("#noteImageInput").addEventListener('change',e=>{insertImageFilesIntoNotes(e.target.files);e.target.value='';});
   $$('[data-section]').forEach(b=>b.addEventListener('click',()=>activateSection(b.dataset.section)));
+  $$('[data-summary-mode]').forEach(b=>b.addEventListener('click',()=>setSummaryMode(b.dataset.summaryMode)));
   $("#openReviewer").onclick=()=>activateSection('reviewer');
+  $("#aiEnable").onclick=enableLocalAI;$("#aiEnhance").onclick=runLocalAIEnhancement;$("#settingsAiEnable").onclick=enableLocalAI;$("#settingsAiDisable").onclick=disableLocalAI;
+  $("#aiAsk").onclick=async()=>{const d=activeDoc(),q=$("#aiQuestion").value.trim(),out=$("#aiAnswer");if(!d)return toast("Select a study material first.","error");if(!q)return toast("Write a question first.","error");out.textContent="Thinking locally…";try{out.textContent=await window.StudyVaultAI.ask(d,learnerProfile(),q,{progress:m=>{out.textContent=m.message||"Loading local AI…";}});}catch(e){out.textContent="Local AI could not answer this yet.";toast(e.message||"Local AI unavailable.","error");}};
   $("#copyReviewer").onclick=copyReviewer;$("#downloadReviewer").onclick=downloadReviewer;$("#regenerateReviewer").onclick=async()=>{const d=activeDoc();if(!d)return toast('Select a document first.','error');regenerateDoc(d,true);await saveDoc(d);renderAll();toast('Reviewer, flashcards, and quiz regenerated.','success');};
   $("#prevFlash").onclick=()=>moveFlash(-1);$("#nextFlash").onclick=()=>moveFlash(1);$("#showFlashAnswer").onclick=()=>activeDoc()&&$("#flashAnswer").classList.remove('hidden');$("#knowFlash").onclick=()=>markKnown(true);$("#reviewFlash").onclick=()=>markKnown(false);
   $("#submitQuiz").onclick=submitQuiz;$("#newQuiz").onclick=newQuiz;
@@ -581,7 +955,7 @@ function bind(){
 async function load(){
   try{
     const meta=await dbGet(META_STORE,SETTINGS_KEY);
-    if(meta){state.settings={...state.settings,...meta};state.activeDocId=meta.activeDocId||null;}
+    if(meta){state.settings={...state.settings,...meta,ai:{...state.settings.ai,...(meta.ai||{})},learner:{...defaultLearner(),...(meta.learner||{})}};state.activeDocId=meta.activeDocId||null;}
     state.documents=(await dbGetAll(DOC_STORE)).map(normalizeDoc);
     for(const d of state.documents)await dbPut(DOC_STORE,d);
     if(!state.activeDocId)state.activeDocId=state.documents[0]?.id||null;
@@ -589,6 +963,9 @@ async function load(){
     if(state.settings.pinHash)lockApp();
   }catch(e){console.error(e);toast('StudyVault could not initialize IndexedDB.','error');}
 }
+
+window.addEventListener("unhandledrejection",e=>{console.error(e.reason||e);toast("A background task failed. Your saved study data was kept.","error");});
+window.addEventListener("error",e=>{if(e?.error)console.error(e.error);});
 
 bind();
 setEngineStatus("idle — loads when a PDF is added");
