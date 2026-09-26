@@ -17,10 +17,28 @@ function cleanText(value) {
     .replace(/```\s*$/i, "")
     .trim();
 }
-function devicePreference() {
-  return self.navigator?.gpu ? "webgpu" : "wasm";
+function isAndroid() { return /Android/i.test(self.navigator?.userAgent || ""); }
+function deviceMemory() { return Number(self.navigator?.deviceMemory || 0); }
+function cores() { return Number(self.navigator?.hardwareConcurrency || 0); }
+function deviceProfile() {
+  const android = isAndroid();
+  const memory = deviceMemory();
+  const cpu = cores();
+  const gpu = !!self.navigator?.gpu;
+  const conservative = android && ((memory && memory <= 4) || (cpu && cpu <= 4));
+  return { android, memory, cpu, gpu, conservative };
 }
-function dtypeFor(device) { return device === "webgpu" ? "q4f16" : "q4"; }
+function devicePreference() {
+  const p = deviceProfile();
+  // Android WebGPU is preferred only when the browser exposes it. Low-memory phones
+  // still get a CPU/WASM path instead of risking a GPU allocation failure.
+  return p.gpu && !p.conservative ? "webgpu" : "wasm";
+}
+function dtypeFor(device, attempt=0) {
+  // q4 is the safer mobile WebGPU format; q4f16 is attempted only on capable devices.
+  if (device === "webgpu") return attempt === 0 ? "q4" : "q4f16";
+  return "q4";
+}
 
 async function getRuntime() {
   if (runtime) return runtime;
@@ -42,11 +60,13 @@ async function ensurePipeline() {
   if (pipe) return pipe;
   const mod = await getRuntime();
   const preferred = devicePreference();
-  const tryLoad = async (device) => {
-    post("status", { message: `Loading on-device AI (${device === "webgpu" ? "GPU" : "CPU/WASM"})…` });
+  const profile = deviceProfile();
+  post("device", { android: profile.android, memory: profile.memory, cpu: profile.cpu, gpu: profile.gpu, conservative: profile.conservative });
+  const tryLoad = async (device, attempt=0) => {
+    post("status", { message: `Loading on-device AI (${device === "webgpu" ? "mobile GPU" : "CPU/WASM"})…` });
     return mod.pipeline("text-generation", MODEL, {
       device,
-      dtype: dtypeFor(device),
+      dtype: dtypeFor(device, attempt),
       progress_callback: (info) => {
         if (info?.status === "progress") {
           post("progress", {
@@ -62,16 +82,22 @@ async function ensurePipeline() {
     });
   };
   try {
-    pipe = await tryLoad(preferred);
+    pipe = await tryLoad(preferred, 0);
   } catch (firstError) {
-    if (preferred !== "wasm") {
-      post("status", { message: "GPU path failed; switching to CPU/WASM fallback…" });
-      pipe = await tryLoad("wasm");
+    if (preferred === "webgpu") {
+      try {
+        post("status", { message: "Mobile GPU format was unavailable; trying a compatible GPU format…" });
+        pipe = await tryLoad("webgpu", 1);
+      } catch {
+        post("status", { message: "GPU path unavailable; switching to CPU/WASM fallback…" });
+        pipe = await tryLoad("wasm", 0);
+      }
     } else {
       throw firstError;
     }
   }
-  post("ready", { model: MODEL, device: preferred === "webgpu" ? "webgpu" : "wasm" });
+  const actualDevice = preferred === "webgpu" && pipe ? "webgpu" : "wasm";
+  post("ready", { model: MODEL, device: actualDevice, android: profile.android, conservative: profile.conservative });
   return pipe;
 }
 
@@ -125,7 +151,7 @@ async function generate(messages, options = {}, requestId = 0) {
       })
     : undefined;
   const result = await generator(messages, {
-    max_new_tokens: options.max_new_tokens || 320,
+    max_new_tokens: options.max_new_tokens || (deviceProfile().android ? 192 : 320),
     do_sample: false,
     return_full_text: false,
     streamer
@@ -149,7 +175,7 @@ function groundingScore(output, source, terms = []) {
 async function runReviewer(msg) {
   const source = String(msg.source || "").slice(0, 26000);
   const profile = String(msg.profile || "");
-  const chunks = sourceChunks(source, 4800, 6);
+  const chunks = sourceChunks(source, 5200, 3);
   const summaries = [];
 
   for (let i = 0; i < chunks.length; i++) {
@@ -192,30 +218,54 @@ ${source.slice(0, 9500)}`;
   const text = await generate([
     { role: "system", content: "You are a source-grounded study tutor. Accuracy is more important than creativity. If evidence is insufficient, say so." },
     { role: "user", content: finalPrompt }
-  ], { max_new_tokens: 620 }, msg.requestId);
+  ], { max_new_tokens: 320 }, msg.requestId);
   return { text, score: groundingScore(text, source, msg.terms || []) };
 }
 
 async function runAsk(msg) {
   const source = String(msg.source || "").slice(0, 18000);
   const text = await generate([
-    { role: "system", content: "Answer only from the supplied study material. State when the answer is not supported by the material. Be concise and educational." },
-    { role: "user", content: `STUDENT QUESTION:\n${msg.question}\n\nSTUDY MATERIAL:\n${source}` }
-  ], { max_new_tokens: 360 }, msg.requestId);
-  return { text, score: groundingScore(text, source, msg.terms || []) };
+    {
+      role: "system",
+      content:
+        "You are a family study tutor with solid knowledge of English (grammar, essay structure), mathematics, general science, and electronics/electrical basics (Ohm's law, components, units like V, A, Ω, W, Hz). " +
+        "When STUDY MATERIAL is provided, prefer it and quote or paraphrase it faithfully. " +
+        "If the material is thin or the question is general curriculum (e.g. Ohm's law, thesis statements, quadratic formula), you may teach clear foundational knowledge. " +
+        "Label clearly: say when an answer comes from the student's material vs general knowledge. Be concise, accurate, and encouraging. Never invent citations from the PDF."
+    },
+    {
+      role: "user",
+      content: `STUDENT QUESTION:\n${msg.question}\n\nSTUDY MATERIAL (may be empty or partial):\n${source || "(none loaded — use general curriculum knowledge)"}`
+    }
+  ], { max_new_tokens: 260 }, msg.requestId);
+  // Grounding is softer when source is empty — still return a score for UI
+  const score = source.trim() ? groundingScore(text, source, msg.terms || []) : 70;
+  return { text, score };
 }
+
+let loadAbort = null;
 
 self.onmessage = async event => {
   const msg = event.data || {};
   if (msg.type === "cancel") {
     cancelled = true;
     activeRequest = 0;
+    try { loadAbort?.abort?.(); } catch {}
+    loadAbort = null;
+    // Drop in-flight pipeline reference so a later load starts clean
+    loading = null;
     post("cancelled");
     return;
   }
   if (msg.type === "load") {
     cancelled = false;
-    try { await ensurePipeline(); } catch (error) { post("error", { message: error?.message || String(error) }); }
+    loadAbort = typeof AbortController !== "undefined" ? new AbortController() : null;
+    try {
+      await ensurePipeline();
+      if (cancelled) post("cancelled");
+    } catch (error) {
+      if (!cancelled) post("error", { message: error?.message || String(error) });
+    }
     return;
   }
   if (msg.type !== "task") return;
@@ -223,6 +273,10 @@ self.onmessage = async event => {
   cancelled = false;
   try {
     const result = msg.task === "reviewer" ? await runReviewer(msg) : await runAsk(msg);
+    if (cancelled || Number(msg.requestId) !== activeRequest) {
+      post("cancelled");
+      return;
+    }
     post("done", { requestId: msg.requestId, text: result.text, groundingScore: result.score, model: MODEL, device: self.navigator?.gpu ? "webgpu" : "wasm" });
   } catch (error) {
     if (!cancelled) post("error", { requestId: msg.requestId, message: error?.message || String(error) });
