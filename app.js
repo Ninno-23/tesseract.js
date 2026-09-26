@@ -2,8 +2,8 @@
 (() => {
 "use strict";
 
-const APP_VERSION = 25;
-const BUILD_ID = "2026-09-26-final-phone-v25";
+const APP_VERSION = 27;
+const BUILD_ID = "2026-09-26-wise-tutor-v27";
 const MAX_FLASHCARDS = 200;
 const VERSION_URL = "./version.json";
 const DB_NAME = "studyvault-v5";
@@ -167,6 +167,37 @@ const DOMAIN_KB = [
   {keys:["ttl","cmos","logic level","high low"],domain:"electronics",
     answer:"Digital levels are **HIGH (1)** and **LOW (0)** within voltage ranges set by the family (e.g. TTL, CMOS).\nNever assume exact 5 V or 3.3 V without checking the datasheet. Floating inputs on CMOS can cause bad behavior — tie unused inputs to a valid level."},
   // end logic gates
+  // —— Circuit symbols (from standard electronics sheets) ——
+  {keys:["wire","wires joined","wires not joined"],domain:"electronics",
+    answer:"**Wire** passes current easily between parts of a circuit.\n**Wires joined** are shown with a blob at the connection (stagger crossroads into T-junctions).\n**Wires not joined** may use a bridge symbol so a crossing is not mistaken for a join."},
+  {keys:["cell","battery","dc supply","ac supply"],domain:"electronics",
+    answer:"**Cell** supplies energy; the larger terminal is positive (+). One cell is often called a battery, but a **battery** is two or more cells.\n**DC supply** = current always one direction. **AC supply** = current continually reverses."},
+  {keys:["fuse"],domain:"electronics",
+    answer:"A **fuse** is a safety device that blows (melts) if current exceeds a set value, protecting the rest of the circuit."},
+  {keys:["transformer"],domain:"electronics",
+    answer:"A **transformer** has two coils linked by an iron core. It steps AC voltages up or down. Energy transfers by magnetic field — no direct electrical connection between coils."},
+  {keys:["earth","ground"],domain:"electronics",
+    answer:"**Earth (ground)** is a connection to earth / 0 V reference. In many circuits it is the 0 V of the supply; for mains it can mean true earth."},
+  {keys:["lamp","heater","motor","bell","buzzer"],domain:"electronics",
+    answer:"These are **output transducers**:\n• **Lamp** — electrical energy → light (lighting vs indicator symbols differ)\n• **Heater** — electrical energy → heat\n• **Motor** — electrical energy → motion\n• **Bell / buzzer** — electrical energy → sound"},
+  {keys:["push switch","push-to-break","spst","spdt","dpst","dpdt","relay","on-off switch"],domain:"electronics",
+    answer:"**Switches** control current paths.\n• Push-to-make: on only while pressed\n• Push-to-break: off only while pressed\n• SPST: simple on-off\n• SPDT: 2-way changeover\n• DPST/DPDT: double-pole (often mains / motor reverse)\n• **Relay**: electrically operated switch (coil can switch a higher-voltage circuit); NO / COM / NC contacts"},
+  {keys:["variable resistor","rheostat","potentiometer","preset"],domain:"electronics",
+    answer:"**Resistor** restricts current (e.g. limit LED current).\n• **Rheostat** (2 contacts) — usually control current\n• **Potentiometer** (3 contacts) — usually control voltage / position signal\n• **Preset** — set once with a screwdriver, cheaper for projects"},
+  {keys:["polarised capacitor","variable capacitor","trimmer capacitor"],domain:"electronics",
+    answer:"**Capacitor** stores charge; used in timing with a resistor; can block DC and pass AC.\n**Polarised** types must be connected the correct way round.\n**Variable / trimmer** capacitors are used in radio tuning / set-and-forget adjustment."},
+  {keys:["zener","photodiode","led","light emitting"],domain:"electronics",
+    answer:"**Diode** allows current mainly one way.\n**LED** converts electrical energy to light.\n**Zener diode** holds a fixed voltage across its terminals.\n**Photodiode** is light-sensitive."},
+  {keys:["npn","pnp","phototransistor"],domain:"electronics",
+    answer:"**NPN / PNP transistors** amplify current; used in amplifiers and switches.\n**Phototransistor** is light-sensitive."},
+  {keys:["microphone","earphone","loudspeaker","piezo","aerial","antenna","amplifier"],domain:"electronics",
+    answer:"**Microphone** sound → electrical. **Earphone / loudspeaker / piezo** electrical → sound.\n**Amplifier** (triangle symbol) is often a whole circuit block, not one part.\n**Aerial / antenna** receives or transmits radio signals."},
+  {keys:["voltmeter","ammeter","galvanometer","ohmmeter","oscilloscope"],domain:"electronics",
+    answer:"**Voltmeter** measures voltage (potential difference).\n**Ammeter** measures current.\n**Galvanometer** measures very small currents (~1 mA or less).\n**Ohmmeter** measures resistance.\n**Oscilloscope** shows signal shape vs time."},
+  {keys:["ldr","thermistor","light dependent"],domain:"electronics",
+    answer:"**LDR** (Light Dependent Resistor): light → resistance change.\n**Thermistor**: temperature → resistance change."},
+  {keys:["ex-or","ex-nor","exor","exnor"],domain:"electronics",
+    answer:"**EX-OR (XOR)**: true when inputs differ (only two inputs).\n**EX-NOR (XNOR)**: true when inputs are the same; output bubble means NOT of XOR."},
   // —— Math ——
   {keys:["pythagorean","pythagoras","right triangle","a2+b2"],domain:"math",
     answer:"**Pythagorean theorem** (right triangle): a² + b² = c² where c is the hypotenuse."},
@@ -226,7 +257,7 @@ function domainKnowledgeAnswer(question){
     }
     if(score>bestScore){bestScore=score;best=entry;}
   }
-  if(!best||bestScore<4)return null;
+  if(!best||bestScore<3)return null;
   return {domain:best.domain,answer:best.answer,score:bestScore};
 }
 
@@ -601,7 +632,7 @@ async function unlockApp(){
   }
 }
 
-const REVIEW_ENGINE_VERSION = 12;
+const REVIEW_ENGINE_VERSION = 13;
 const SUMMARY_MODES = {
   quick:    {label:"Quick Scan", sentenceCount:6,  maxChars:900},
   standard: {label:"Standard",   sentenceCount:10, maxChars:1500},
@@ -715,30 +746,119 @@ function contextHeading(page,headings){
   return list.length?list[list.length-1].text:"";
 }
 
+/** Clean answer text for flashcards / tutor — short, study-ready, no table junk. */
+function cleanAnswer(text,maxLen=220){
+  let t=normalize(String(text||""))
+    .replace(/^(?:component|circuit symbol|function of component|function of gate)\s*[:|]?\s*/i,"")
+    .replace(/\bFunction of Component\b/gi,"")
+    .replace(/\s*\|\s*/g," ")
+    .replace(/\s{2,}/g," ")
+    .trim();
+  if(!t)return "";
+  // Prefer first 1–2 full sentences
+  const parts=t.match(/[^.!?]+[.!?]?/g)||[t];
+  t=parts.slice(0,2).join(" ").trim();
+  if(t.length>maxLen){
+    let cut=t.slice(0,maxLen);
+    const b=Math.max(cut.lastIndexOf(". "),cut.lastIndexOf(" "));
+    if(b>maxLen*0.5)cut=cut.slice(0,b+(cut[b]==="."?1:0));
+    t=cut.trim();
+    if(!/[.!?]$/.test(t))t+="…";
+  }
+  return t.charAt(0).toUpperCase()+t.slice(1);
+}
+
+/**
+ * Pull Component → Function pairs from electronics symbol sheets and glossary tables.
+ * Handles lines like: "Fuse  A safety device which will blow…"
+ */
+function extractGlossaryPairs(doc){
+  const pairs=[];
+  const seen=new Set();
+  const pageBlob=(doc.pageTexts||[]).map(p=>String(p.text||"")).join("\n");
+  const raw=pageBlob||String(doc.rawText||"");
+  const lines=raw.split(/\n+/).map(l=>normalize(l)).filter(Boolean);
+  // Known component name starts (electronics sheet + general)
+  const nameRe=/^((?:Wire|Wires joined|Wires not joined|Cell|Battery|DC supply|AC supply|Fuse|Transformer|Earth(?:\s*\(Ground\))?|Ground|Lamp(?:\s*\([^)]+\))?|Heater|Motor|Bell|Buzzer|Inductor(?:\s*\([^)]+\))?|Push(?:\s*Switch|\s*to[- ]Break)?(?:\s*\([^)]+\))?|On-Off Switch(?:\s*\([^)]+\))?|2-way Switch(?:\s*\([^)]+\))?|Dual On-Off Switch(?:\s*\([^)]+\))?|Reversing Switch(?:\s*\([^)]+\))?|Relay|Resistor|Variable Resistor(?:\s*\([^)]+\))?|Capacitor(?:[,\s]+polarised)?|Variable Capacitor|Trimmer Capacitor|Diode|LED|Light Emitting Diode|Zener Diode|Photodiode|Transistor(?:\s+NPN|\s+PNP)?|Phototransistor|Microphone|Earphone|Loudspeaker|Piezo Transducer|Amplifier(?:\s*\([^)]+\))?|Aerial(?:\s*\([^)]+\))?|Antenna|Voltmeter|Ammeter|Galvanometer|Ohmmeter|Oscilloscope|LDR|Thermistor|NOT|AND|NAND|OR|NOR|EX-OR|EX-NOR|XOR|XNOR)(?:\s*\([^)]+\))?)\b/i;
+
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    if(/^(?:component|circuit symbol|function)/i.test(line)&&line.length<40)continue;
+    if(/wires and connections|power supplies|output devices|switches|resistors|capacitors|diodes|transistors|logic gates|meters/i.test(line)&&line.length<50)continue;
+
+    let term="",fn="";
+    const m=line.match(nameRe);
+    if(m){
+      term=m[1].trim();
+      fn=line.slice(m[0].length).replace(/^[\s|:–—-]+/,"").trim();
+      // Function may continue on next lines
+      let j=i+1;
+      while(j<lines.length&&fn.length<40&&!nameRe.test(lines[j])&&lines[j].length>12&&!/^(?:component|circuit)/i.test(lines[j])){
+        fn=(fn+" "+lines[j]).trim();j++;
+      }
+    }else{
+      // Generic: short name + long explanation on same line
+      const gm=line.match(/^([A-Z][A-Za-z0-9+\/\-() ]{1,42}?)\s{2,}(.{20,})$/);
+      if(gm){term=gm[1].trim();fn=gm[2].trim();}
+    }
+    if(!term||!fn||fn.length<15)continue;
+    // Drop if "function" is actually another header
+    if(/^(?:wires|power|switches|resistors|function of)/i.test(fn))continue;
+    term=term.replace(/\s+/g," ").trim();
+    const key=term.toLowerCase();
+    if(seen.has(key))continue;
+    seen.add(key);
+    pairs.push({term,definition:cleanAnswer(fn,280),page:null,confidence:0.92,kind:"component"});
+    if(pairs.length>=80)break;
+  }
+
+  // Also scan units for "X is a device which…"
+  for(const u of sentenceUnits(doc)){
+    const text=normalize(u.text||"");
+    const m=text.match(/^([A-Za-z][A-Za-z0-9+\/\-() ]{1,40}?)\s+(?:is|are|means)\s+(.{15,})$/i);
+    if(!m)continue;
+    const term=m[1].trim();
+    const key=term.toLowerCase();
+    if(seen.has(key)||term.length>45)continue;
+    seen.add(key);
+    pairs.push({term,definition:cleanAnswer(text,280),page:unitPage(u),confidence:0.85,kind:"definition"});
+    if(pairs.length>=80)break;
+  }
+  return pairs;
+}
+
 function detectDefinitions(units,terms){
-  const defs=[];const patterns=[
+  // Prefer structured glossary pairs (electronics symbol sheets, etc.)
+  const fromGlossary=[];
+  try{
+    // units alone may not have pageTexts — caller often has doc via sentenceUnits
+  }catch{}
+  const defs=[];
+  const patterns=[
     /^(.{2,80}?)\s+(?:is|are|means|refers to|is defined as|are defined as|is known as|is called)\s+(.{12,})$/i,
     /^(.{2,80}?)\s*:\s*(.{12,})$/i,
-    // OCR / study-sheet style: "Hypoxia - low oxygen" or "Hypoxia — ..."
     /^(.{2,60}?)\s*[-–—]\s+(.{12,})$/,
     /^(.{2,60}?)\s*\(\s*(?:def(?:inition)?|means)\s*\)\s*[-–—:]?\s*(.{12,})$/i,
-    /(?:the term|the concept|the process)\s+(.{2,80}?)\s+(?:is|means|refers to)\s+(.{12,})/i
+    /(?:the term|the concept|the process)\s+(.{2,80}?)\s+(?:is|means|refers to)\s+(.{12,})/i,
+    // Electronics sheet style: short name then long function sentence
+    /^((?:[A-Z][A-Za-z0-9+\/\-()]*(?:\s+[A-Za-z0-9+\/\-()]+){0,5}))\s+((?:A |An |This |The |Supplies |Allows |Restricts |Converts |Stores |Creates |Amplifies |Measures |Only |Used ).{12,})$/
   ];
   for(const u of units){
-    // Repair common OCR line breaks before matching definitions
     const text=normalize(String(u.text||"").replace(/([A-Za-z])-\s*\n\s*([a-z])/g,"$1$2"));
-    if(text.length<20)continue;
+    if(text.length<18)continue;
     let hit=null;
     for(const re of patterns){const m=text.match(re);if(m){hit=m;break;}}
     let term=hit?.[1]?.trim()||terms.find(t=>text.toLowerCase().includes(String(t).toLowerCase()));
     if(!term)continue;
     term=term.replace(/^(the|a|an)\s+/i,"").replace(/[.:;]+$/,"").trim();
-    if(term.length>70)term=terms.find(t=>text.toLowerCase().includes(String(t).toLowerCase()))||term;
-    if(!term||term.length<2)continue;
+    if(term.length>55)term=terms.find(t=>text.toLowerCase().includes(String(t).toLowerCase()))||term;
+    if(!term||term.length<2||term.length>55)continue;
     if(defs.some(d=>d.term.toLowerCase()===term.toLowerCase()))continue;
-    const confidence=Math.min(0.98,0.58+(hit?0.24:0)+(text.length<260?0.08:0)+(unitPage(u)?0.04:0)+(/[-–—:]/.test(text)?0.04:0));
-    defs.push({term,definition:text,page:unitPage(u),confidence});
-    if(defs.length>=24)break;
+    const body=hit?.[2]?cleanAnswer(hit[2],260):cleanAnswer(text,260);
+    if(body.length<12)continue;
+    const confidence=Math.min(0.98,0.58+(hit?0.24:0)+(text.length<260?0.08:0)+(unitPage(u)?0.04:0));
+    defs.push({term,definition:body,page:unitPage(u),confidence});
+    if(defs.length>=60)break;
   }
   return defs;
 }
@@ -856,8 +976,22 @@ function synthesizeSummary(units,terms,headings,mode){
   return out;
 }
 
-function detectStructuredPatterns(units,terms,headings){
-  const definitions=detectDefinitions(units,terms);
+function mergeDefinitions(primary,extra){
+  const out=[...(primary||[])];
+  const seen=new Set(out.map(d=>d.term.toLowerCase()));
+  for(const d of extra||[]){
+    const k=String(d.term||"").toLowerCase();
+    if(!k||seen.has(k))continue;
+    seen.add(k);out.push(d);
+  }
+  return out;
+}
+function detectStructuredPatterns(units,terms,headings,doc=null){
+  let definitions=detectDefinitions(units,terms);
+  if(doc){
+    const glossary=extractGlossaryPairs(doc);
+    definitions=mergeDefinitions(glossary,definitions);
+  }
   const processes=units.filter(u=>classifyUnit(u,terms).hits.includes("process")).slice(0,18).map(u=>({text:u.text,page:unitPage(u)}));
   const causes=units.filter(u=>classifyUnit(u,terms).hits.includes("cause-effect")).slice(0,18).map(u=>({text:u.text,page:unitPage(u)}));
   const comparisons=units.filter(u=>classifyUnit(u,terms).hits.includes("comparison")).slice(0,16).map(u=>({text:u.text,page:unitPage(u)}));
@@ -868,24 +1002,58 @@ function detectStructuredPatterns(units,terms,headings){
 }
 
 function buildReviewer(doc){
-  const units=sentenceUnits(doc),terms=Array.isArray(doc.terms)&&doc.terms.length?doc.terms:candidateTerms(doc),headings=detectHeadings(doc);
-  const s=detectStructuredPatterns(units,terms,headings);
-  const overview=synthesizeSummary(units,terms,headings,doc.summaryMode||"standard");
-  const takeaways=selectEvidence(units,terms,headings,10).map(x=>({text:x.u.text,page:unitPage(x.u),heading:contextHeading(unitPage(x.u),headings)}));
-  const memory=terms.slice(0,18).map(term=>{const u=units.find(x=>x.text.toLowerCase().includes(term.toLowerCase()));return {term,clue:u?normalize(u.text).slice(0,180):`Connect ${term} to an example or purpose from the material.`,page:unitPage(u)};});
+  const units=sentenceUnits(doc);
+  let terms=Array.isArray(doc.terms)&&doc.terms.length?doc.terms:candidateTerms(doc);
+  const headings=detectHeadings(doc);
+  const s=detectStructuredPatterns(units,terms,headings,doc);
+  // Glossary sheets: promote component names into terms
+  if((s.definitions||[]).length>=8){
+    const extra=s.definitions.map(d=>d.term).filter(Boolean);
+    const merged=[];
+    const seen=new Set();
+    for(const t of [...extra,...terms]){
+      const k=String(t).toLowerCase();if(seen.has(k))continue;seen.add(k);merged.push(t);
+      if(merged.length>=60)break;
+    }
+    terms=merged;
+  }
+  let overview=synthesizeSummary(units,terms,headings,doc.summaryMode||"standard");
+  // Smarter overview for component/symbol reference sheets
+  if((s.definitions||[]).length>=6){
+    const top=s.definitions.slice(0,12).map(d=>`• ${d.term} — ${cleanAnswer(d.definition,110)}`);
+    const head=(doc.summaryMode==="cram")?"Exam cram — components to know":"This material is a component / symbol reference. Master these first:";
+    overview=`${head}\n${top.join("\n")}`;
+  }
+  const takeaways=(s.definitions||[]).length>=6
+    ? s.definitions.slice(0,14).map(d=>({text:`${d.term}: ${cleanAnswer(d.definition,140)}`,page:d.page,heading:""}))
+    : selectEvidence(units,terms,headings,10).map(x=>({text:cleanAnswer(x.u.text,160),page:unitPage(x.u),heading:contextHeading(unitPage(x.u),headings)}));
+  const memory=(s.definitions||[]).slice(0,24).map(d=>({term:d.term,clue:cleanAnswer(d.definition,160),page:d.page}));
+  if(memory.length<8){
+    for(const term of terms.slice(0,18)){
+      if(memory.some(m=>m.term.toLowerCase()===String(term).toLowerCase()))continue;
+      const u=units.find(x=>x.text.toLowerCase().includes(String(term).toLowerCase()));
+      memory.push({term,clue:u?cleanAnswer(u.text,160):`Connect ${term} to its purpose in the material.`,page:unitPage(u)});
+    }
+  }
   const questions=[];
-  s.definitions.slice(0,8).forEach(d=>questions.push({type:"definition",q:`Define ${d.term} in your own words and give one detail from the material.`,page:d.page}));
+  s.definitions.slice(0,16).forEach(d=>{
+    questions.push({type:"definition",q:`What is the function of a ${d.term}?`,page:d.page});
+    questions.push({type:"recall",q:`In one sentence, explain what a ${d.term} does in a circuit.`,page:d.page});
+  });
   s.processes.slice(0,5).forEach(p=>questions.push({type:"process",q:`Explain the process or sequence described on page ${p.page??"the source"}.`,page:p.page}));
   s.causes.slice(0,5).forEach(p=>questions.push({type:"cause-effect",q:`What cause-and-effect relationship is described in this point?`,page:p.page}));
-  s.comparisons.slice(0,4).forEach(p=>questions.push({type:"compare",q:`What two ideas are being compared or contrasted here?`,page:p.page}));
-  takeaways.slice(0,8).forEach(p=>questions.push({type:"recall",q:`Explain this key idea without looking at the source: ${p.text}`,page:p.page}));
+  takeaways.slice(0,6).forEach(p=>questions.push({type:"recall",q:`Explain without looking: ${cleanAnswer(p.text,90)}`,page:p.page}));
   const checklist=[];
-  terms.slice(0,10).forEach(t=>checklist.push(`Explain ${t} without reading the source.`));
-  s.definitions.slice(0,6).forEach(d=>checklist.push(`Give the definition of ${d.term} and one example.`));
+  s.definitions.slice(0,12).forEach(d=>checklist.push(`Name ${d.term} and state its function from memory.`));
+  terms.slice(0,8).forEach(t=>{if(!checklist.some(c=>c.includes(t)))checklist.push(`Explain ${t} without reading the source.`);});
   if(s.processes.length)checklist.push("Reconstruct the important process steps from memory.");
-  if(s.causes.length)checklist.push("Explain the main cause-and-effect relationships.");
   if(s.facts.length)checklist.push("Memorize the important formulas, numbers, units, or factual thresholds.");
   (doc.media||[]).forEach((m,i)=>checklist.push(m.ocrText?`Review the text in photo ${i+1}.`:`Explain what photo ${i+1} is showing and why it matters.`));
+  // Better exam cram for glossary sheets
+  let examCramOverride=null;
+  if(s.definitions.length>=6){
+    examCramOverride="Remember these\n"+s.definitions.slice(0,14).map(d=>`• ${d.term}: ${cleanAnswer(d.definition,90)}`).join("\n");
+  }
   const pages=[];
   for(const p of doc.pageTexts||[]){
     const pu=units.filter(u=>Number(u.page)===Number(p.page));
@@ -906,12 +1074,12 @@ function buildReviewer(doc){
   }
   conceptMap.sort((a,b)=>b.strength-a.strength);
   const strategy=buildStrategy(s,terms,doc.media||[],doc.summaryMode||"standard");
-  const examCram=synthesizeSummary(units,terms,headings,"cram");
+  const examCram=examCramOverride||synthesizeSummary(units,terms,headings,"cram");
   const confidence=Math.round(clamp((Math.min(1,units.length/20)*.25)+(Math.min(1,terms.length/20)*.25)+(Math.min(1,s.definitions.length/6)*.20)+(Math.min(1,takeaways.length/8)*.20)+(headings.length?0.10:0),0,1)*100);
   return {
     engineVersion:REVIEW_ENGINE_VERSION,mode:doc.summaryMode||"standard",overview,strategy,examCram,terms,headings,
     definitions:s.definitions,keyPoints:takeaways,processes:s.processes,causes:s.causes,comparisons:s.comparisons,examples:s.examples,facts:s.facts,
-    questions:questions.slice(0,28),memory,checklist:checklist.slice(0,24),pages:pages.slice(0,80),blueprint,conceptMap:conceptMap.slice(0,40),confidence
+    questions:questions.slice(0,40),memory,checklist:checklist.slice(0,28),pages:pages.slice(0,80),blueprint,conceptMap:conceptMap.slice(0,40),confidence
   };
 }
 
@@ -968,53 +1136,48 @@ function makeFlashcards(doc){
   const limit=flashcardBudget(doc,r,units);
   const add=(type,q,a,term="",page=null,source="page")=>{
     if(cards.length>=limit)return;
-    q=normalize(q);a=normalize(a);if(q.length<8||a.length<3)return;
+    q=normalize(q);a=cleanAnswer(a,240);if(q.length<8||a.length<8)return;
+    // Reject trash answers (headers, tiny fragments)
+    if(/^(?:component|circuit symbol|function of)/i.test(a))return;
+    if(a.split(/\s+/).length<4)return;
     const id=cardId(doc,type,q,a);if(seen.has(id))return;seen.add(id);
     cards.push({id,type,term,question:q,answer:a,page,source});
   };
-  // Priority layers — fill until budget is reached
+
+  // 1) Clean component / definition cards (highest quality for symbol sheets)
   for(const d of r.definitions||[]){
-    add("definition",`What is ${d.term}?`,d.definition,d.term,d.page);
-    add("explain",`Explain ${d.term} in simple words.`,d.definition,d.term,d.page);
+    const ans=cleanAnswer(d.definition,220);
+    add("definition",`What is the function of a ${d.term}?`,ans,d.term,d.page);
+    add("name-it",`Which component: ${ans}`,d.term,d.term,d.page);
+    add("explain",`Explain ${d.term} like you are teaching a classmate.`,ans,d.term,d.page);
   }
-  const termCap=Math.min((r.terms||[]).length,Math.max(24,Math.floor(limit/3)));
+
+  // 2) Term recall with cleaned unit answers only
+  const termCap=Math.min((r.terms||[]).length,Math.max(20,Math.floor(limit/3)));
   for(const term of (r.terms||[]).slice(0,termCap)){
+    if((r.definitions||[]).some(d=>d.term.toLowerCase()===String(term).toLowerCase()))continue;
     const u=units.find(x=>x.text.toLowerCase().includes(String(term).toLowerCase()));if(!u)continue;
-    add("cloze",`Complete the statement:\n${clozeFromSentence(u.text,term)}`,term,term,u.page);
-    add("recall",`What does ${term} do, describe, or relate to in this material?`,u.text,term,u.page);
+    const ans=cleanAnswer(u.text,200);
+    add("recall",`What does ${term} do in this material?`,ans,term,u.page);
+    const cloze=clozeFromSentence(u.text,term);
+    if(cloze&&cloze.includes("_____"))add("cloze",`Fill in the blank:\n${cleanAnswer(cloze,200)}`,String(term),term,u.page);
   }
-  for(const p of (r.processes||[]).slice(0,Math.min(30,Math.ceil(limit/8))))add("process",`What process or sequence is described here?`,`Explain the sequence in this source statement: ${p.text}`,"",p.page);
-  for(const p of (r.causes||[]).slice(0,Math.min(24,Math.ceil(limit/10))))add("cause-effect",`What cause leads to what effect in this material?`,p.text,"",p.page);
-  for(const p of (r.comparisons||[]).slice(0,Math.min(20,Math.ceil(limit/12))))add("compare",`What ideas are being compared in this statement?`,p.text,"",p.page);
-  for(const f of (r.facts||[]).slice(0,Math.min(30,Math.ceil(limit/8))))add("fact",`What important fact, number, unit, or formula should you remember?`,f.text,"",f.page);
-  for(const q of (r.questions||[]).slice(0,Math.min(40,Math.ceil(limit/5)))){
-    const u=units.find(x=>Number(x.page)===Number(q.page))||units[0];
-    add("exam-recall",q.q||q,u?.text||String(q.q||q),"",q.page);
+
+  for(const p of (r.processes||[]).slice(0,12))add("process",`Describe this process from the material.`,cleanAnswer(p.text,200),"",p.page);
+  for(const f of (r.facts||[]).slice(0,16))add("fact",`What fact or formula should you remember?`,cleanAnswer(f.text,200),"",f.page);
+  for(const q of (r.questions||[]).slice(0,20)){
+    const def=(r.definitions||[]).find(d=>(q.q||"").toLowerCase().includes(String(d.term).toLowerCase()));
+    const ans=def?cleanAnswer(def.definition,200):cleanAnswer((units.find(x=>Number(x.page)===Number(q.page))||units[0])?.text||"",200);
+    add("exam-recall",q.q||q,ans,def?.term||"",q.page);
   }
   for(const m of doc.media||[]){
-    const answer=m.caption||m.ocrText;if(!answer)continue;
+    const answer=cleanAnswer(m.caption||m.ocrText||"",200);if(!answer)continue;
     add("visual",`What should you remember from ${m.name}?`,answer,"",null,"photo");
   }
   for(const p of r.keyPoints||[]){
     if(cards.length>=limit)break;
-    add("key-point","What is the most important idea in this passage?",typeof p==="string"?p:p.text,"",p.page);
-  }
-  // Extra unit-based cards for dense PDFs (components, listed items, formulas)
-  if(cards.length<limit){
-    for(const u of units){
-      if(cards.length>=limit)break;
-      const t=u.text||"";
-      if(t.length<40||t.length>320)continue;
-      if(looksLikeFormula(t)||/\b(component|gate|resistor|capacitor|symbol|voltage|current)\b/i.test(t)){
-        add("detail",`From the material — what does this state?`,t,"",u.page);
-      }
-    }
-  }
-  if(cards.length<Math.min(36,limit)){
-    for(const u of units){
-      if(cards.length>=Math.min(48,limit))break;
-      if((u.text||"").length>=50)add("source-line",`Recall this idea from the source:`,u.text,"",u.page);
-    }
+    const text=typeof p==="string"?p:p.text;
+    add("key-point",`Key idea — explain it:`,cleanAnswer(text,180),"",p.page);
   }
   return cards.slice(0,limit);
 }
@@ -1710,20 +1873,40 @@ function localTutorAnswer(doc, question){
   const q=qRaw.toLowerCase();
   const source=normalize(doc?.rawText||"");
   const domainHit=domainKnowledgeAnswer(qRaw);
-  const domainTag=detectDomain(q);
 
   // No document loaded: still teach from built-in curriculum
   if(!source){
     if(domainHit){
-      return `📚 Built-in ${domainHit.domain} knowledge (no PDF loaded yet):\n\n${domainHit.answer}\n\nTip: add your class PDF or photos so answers can also quote your exact material.`;
+      return `I’ll teach this clearly from solid ${domainHit.domain} foundations:\n\n${domainHit.answer}\n\nWhen you load your class file, I’ll also match answers to *your* exact wording.`;
     }
-    return "Add a PDF or photo for source-based answers — or ask a general question about English, essay writing, math, science, or electronics (for example: “What is Ohm’s law?” or “How do I structure an essay?”).";
+    return "Add a PDF or photo — or ask about English, essays, math, science, electronics, or logic gates (example: “What does a fuse do?”).";
+  }
+
+  const defs=doc?.reviewerData?.definitions||[];
+  // Direct component lookup — ChatGPT-style short teaching answer
+  if(defs.length){
+    let best=null,bestScore=0;
+    for(const d of defs){
+      const name=String(d.term||"").toLowerCase();
+      if(!name||name.length<2)continue;
+      let score=0;
+      if(q.includes(name))score+=name.length+10;
+      for(const w of name.split(/[^a-z0-9]+/).filter(x=>x.length>2))if(q.includes(w))score+=3;
+      if(score>bestScore){bestScore=score;best=d;}
+    }
+    if(best&&bestScore>=5){
+      const ans=cleanAnswer(best.definition,280);
+      let out=`**${best.term}**\n\n${ans}`;
+      if(domainHit&&domainHit.score>=6)out+=`\n\nExtra foundation:\n${domainHit.answer}`;
+      out+=`\n\nStudy tip: cover the page, say the function out loud, then check the symbol on the sheet.`;
+      return out;
+    }
   }
 
   const sentences=extractSentences(source,120);
   const terms=(doc?.terms||[]).map(t=>typeof t==='string'?t:t?.term||t?.label||"").filter(Boolean);
   const qWords=new Set(q.split(/[^a-z0-9Ωμ]+/).filter(w=>w.length>=2 && !STOP.has(w)));
-  const wantsDef=/what is|define|meaning|definition|who is|what are/.test(q);
+  const wantsDef=/what is|define|meaning|definition|who is|what are|function of|what does/.test(q);
   const wantsEq=/equation|formula|chemical|overall reaction|balanced|stoichiometr|ohm|v\s*=\s*ir|kirchhoff/.test(q)
     || /\b(co2|h2o|o2|c6h12o6|nacl|hcl|v=ir)\b/.test(q);
   const wantsHow=/how does|how do|process|steps|stage|happen|sequence|write an essay|structure/.test(q);
@@ -1841,16 +2024,75 @@ function tutorSuggestionsFor(doc){
   return out.slice(0,5);
 }
 
+/** When user asks to see a picture, fetch a safe educational image (Wikipedia). Needs internet once. */
+async function fetchTopicImage(query){
+  const topic=normalize(query)
+    .replace(/^(?:show|send|give|find|display|draw|picture|photo|image|pic|of|a|an|the|me|please|can|you)\s+/gi,"")
+    .replace(/\b(?:show|send|give|find|display|picture|photo|image|pic|of|a|an|the|me|please)\b/gi," ")
+    .replace(/\s+/g," ")
+    .trim()
+    .slice(0,80);
+  if(!topic||topic.length<2)return null;
+  if(!navigator.onLine)return {error:"offline",topic};
+  try{
+    const title=encodeURIComponent(topic.replace(/\s+/g,"_"));
+    // Try exact summary, then search
+    let data=null;
+    try{
+      const r=await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${title}`,{headers:{Accept:"application/json"}});
+      if(r.ok)data=await r.json();
+    }catch{}
+    if(!data?.thumbnail?.source){
+      const s=await fetch(`https://en.wikipedia.org/w/rest.php/v1/search/title?q=${encodeURIComponent(topic)}&limit=1`,{headers:{Accept:"application/json"}});
+      if(s.ok){
+        const sj=await s.json();
+        const hit=sj?.pages?.[0]?.key||sj?.pages?.[0]?.title;
+        if(hit){
+          const r2=await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(hit)}`,{headers:{Accept:"application/json"}});
+          if(r2.ok)data=await r2.json();
+        }
+      }
+    }
+    if(!data)return {error:"not-found",topic};
+    return {
+      topic:data.title||topic,
+      imageUrl:data.thumbnail?.source||data.originalimage?.source||"",
+      extract:cleanAnswer(data.extract||data.description||"",220),
+      pageUrl:data.content_urls?.desktop?.page||""
+    };
+  }catch(err){
+    console.warn("image fetch failed",err);
+    return {error:"failed",topic};
+  }
+}
+function isPictureRequest(q){
+  return /\b(show|send|give|display|find|picture|photo|image|pic|draw)\b/i.test(q)
+    && /\b(picture|photo|image|pic|of|show me)\b/i.test(q);
+}
+
+function formatWiseAnswer(body,opts={}){
+  // Calm, teacher-like framing without sounding fake-mystical
+  const tip=opts.tip||"";
+  let out=String(body||"").trim();
+  if(!out)return "I need a clearer question or more study text to answer well.";
+  if(tip)out+=`\n\n💡 ${tip}`;
+  return out;
+}
+
 function renderTutorChat(){
   const box=$("#tutorChat");if(!box)return;
   if(!tutorChat.length){
-    box.innerHTML=`<div class="tutor-welcome"><strong>Ask about your material — or curriculum basics.</strong><p>I prefer your PDF/photos, and I also know English, essays, math, science, electronics, and digital logic (AND/OR/NOT/NAND/XOR…). Try “NAND truth table”, “Ohm’s law”, or “quiz me”.</p></div>`;
+    box.innerHTML=`<div class="tutor-welcome"><strong>Your wise study tutor is ready.</strong><p>Ask about your PDF, school subjects, or “show me a picture of …” (needs internet for pictures). Try “What does a fuse do?”, “Ohm’s law”, or “show me a picture of a lion”.</p></div>`;
     return;
   }
   box.innerHTML=tutorChat.map(m=>{
     const who=m.role==="user"?"You":"Tutor";
     const mode=m.mode?`<span class="tutor-mode-tag">${esc(m.mode)}</span>`:"";
-    return `<div class="tutor-msg ${m.role==="user"?"is-user":"is-tutor"}"><div class="tutor-msg-meta"><span>${who}</span>${mode}</div><div class="tutor-msg-body">${esc(m.text).replace(/\n/g,"<br>")}</div></div>`;
+    let body=`<div class="tutor-msg-body">${esc(m.text).replace(/\n/g,"<br>")}</div>`;
+    if(m.imageUrl){
+      body+=`<div class="tutor-img-wrap"><img class="tutor-img" src="${esc(m.imageUrl)}" alt="${esc(m.imageAlt||"Illustration")}" loading="lazy" referrerpolicy="no-referrer"><div class="tutor-img-cap tiny">${esc(m.imageAlt||"")}</div></div>`;
+    }
+    return `<div class="tutor-msg ${m.role==="user"?"is-user":"is-tutor"}"><div class="tutor-msg-meta"><span>${who}</span>${mode}</div>${body}</div>`;
   }).join("");
   box.scrollTop=box.scrollHeight;
 }
@@ -1890,32 +2132,61 @@ async function tutorSendMessage(){
   renderTutorChat();
   if($("#tutorMsgCount"))$("#tutorMsgCount").textContent=String(tutorChat.length);
   const status=$("#tutorStatus");
-  if(status)status.textContent=d?"Thinking…":"Thinking (curriculum)…";
+  if(status)status.textContent="Thinking…";
 
-  let answer="", mode="Instant";
+  let answer="", mode="Wise Tutor", imageUrl="", imageAlt="";
   try{
-    // Instant path first so phones feel responsive
-    answer=localTutorAnswer(d,q);
-    tutorChat.push({role:"tutor",text:answer,mode,at:now()});
-    renderTutorChat();
-    // Optional neural upgrade when model already loaded
-    if(d&&state.settings.ai?.enabled&&aiWorker){
-      if(status)status.textContent="Deepening with on-device AI…";
-      try{
-        const r=await aiRequest("ask",{source:aiQuestionSource(d,q),profile:learnerDigestForAI(),question:q});
-        if(r?.text&&(r.groundingScore==null||r.groundingScore>=30)){
-          answer=r.text;mode="Neural AI";
-          // Replace last tutor bubble with deeper answer
-          for(let i=tutorChat.length-1;i>=0;i--){
-            if(tutorChat[i].role==="tutor"){tutorChat[i]={role:"tutor",text:answer,mode,at:now()};break;}
+    // Picture requests: show an educational image + short description
+    if(isPictureRequest(q)){
+      if(status)status.textContent="Finding a picture…";
+      const img=await fetchTopicImage(q);
+      if(img?.imageUrl){
+        imageUrl=img.imageUrl;
+        imageAlt=img.topic||"Illustration";
+        answer=formatWiseAnswer(
+          `Here is a clear picture of **${img.topic}**.\n\n${img.extract||"A reference image for your study or curiosity."}`,
+          {tip:"Images come from educational sources when you are online."}
+        );
+        mode="Picture";
+      }else if(img?.error==="offline"){
+        answer="I can show pictures when this device is online. Connect once, ask again, and I’ll fetch a clear reference image.";
+        mode="Offline";
+      }else{
+        answer=formatWiseAnswer(
+          `I couldn’t find a safe public picture for “${img?.topic||q}”. Try a simpler name (e.g. “lion”, “volcano”, “resistor”).`,
+          {tip:"You can also add your own photos with Add Photos."}
+        );
+        mode="Picture";
+      }
+    }else{
+      // Instant wise answer from file + curriculum
+      answer=formatWiseAnswer(localTutorAnswer(d,q));
+      mode="Wise Tutor";
+      tutorChat.push({role:"tutor",text:answer,mode,at:now(),imageUrl,imageAlt});
+      renderTutorChat();
+      // Optional neural deepen
+      if(d&&state.settings.ai?.enabled&&aiWorker){
+        if(status)status.textContent="Deepening with on-device AI…";
+        try{
+          const r=await aiRequest("ask",{source:aiQuestionSource(d,q),profile:learnerDigestForAI(),question:q});
+          if(r?.text&&(r.groundingScore==null||r.groundingScore>=28)){
+            answer=formatWiseAnswer(r.text,{tip:"Cross-check important facts with your uploaded notes."});
+            mode="Neural AI";
+            for(let i=tutorChat.length-1;i>=0;i--){
+              if(tutorChat[i].role==="tutor"){tutorChat[i]={role:"tutor",text:answer,mode,at:now()};break;}
+            }
+            renderTutorChat();
           }
-          renderTutorChat();
-        }
-      }catch(e){console.warn("Neural tutor optional path failed",e);}
+        }catch(e){console.warn("Neural tutor optional path failed",e);}
+      }
+      if(status)status.textContent=mode==="Neural AI"?"Answered with on-device AI":"Answered";
+      return;
     }
-    if(status)status.textContent=mode==="Neural AI"?"Answered with on-device AI":"Answered with Instant Tutor";
+    tutorChat.push({role:"tutor",text:answer,mode,at:now(),imageUrl,imageAlt});
+    renderTutorChat();
+    if(status)status.textContent=mode==="Picture"?"Picture ready":"Answered";
   }catch(e){
-    tutorChat.push({role:"tutor",text:e.message||"Could not answer.",mode:"Error",at:now()});
+    tutorChat.push({role:"tutor",text:e.message||"Could not answer right now. Try again in a moment.",mode:"Error",at:now()});
     if(status)status.textContent="Could not answer";
   }finally{
     tutorBusy=false;

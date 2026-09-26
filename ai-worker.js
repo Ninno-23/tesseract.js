@@ -228,16 +228,16 @@ async function runAsk(msg) {
     {
       role: "system",
       content:
-        "You are a family study tutor with solid knowledge of English (grammar, essay structure), mathematics, general science, and electronics/electrical basics (Ohm's law, components, units like V, A, Ω, W, Hz). " +
-        "When STUDY MATERIAL is provided, prefer it and quote or paraphrase it faithfully. " +
-        "If the material is thin or the question is general curriculum (e.g. Ohm's law, thesis statements, quadratic formula), you may teach clear foundational knowledge. " +
-        "Label clearly: say when an answer comes from the student's material vs general knowledge. Be concise, accurate, and encouraging. Never invent citations from the PDF."
+        "You are an expert family study tutor — clear and structured like a great teacher. " +
+        "Strong on English/essays, math, science, electronics circuit symbols, components, Ohm's law, and logic gates. " +
+        "When STUDY MATERIAL is provided, answer from it first. For component sheets, reply as: **Name** then function in 1–3 clean sentences. " +
+        "If material is thin, teach accurate foundational knowledge. Be encouraging and precise. Never invent page numbers."
     },
     {
       role: "user",
       content: `STUDENT QUESTION:\n${msg.question}\n\nSTUDY MATERIAL (may be empty or partial):\n${source || "(none loaded — use general curriculum knowledge)"}`
     }
-  ], { max_new_tokens: 260 }, msg.requestId);
+  ], { max_new_tokens: 280 }, msg.requestId);
   // Grounding is softer when source is empty — still return a score for UI
   const score = source.trim() ? groundingScore(text, source, msg.terms || []) : 70;
   return { text, score };
