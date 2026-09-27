@@ -189,7 +189,7 @@ async function runReviewer(msg) {
   }
 
   post("status", { message: "Synthesizing the complete reviewer…" });
-  const finalPrompt = `Create a coherent, student-friendly study reviewer using ONLY the evidence below.
+  const finalPrompt = `Rewrite the VERIFIED evidence into a coherent, student-friendly study reviewer. You are an editor, not a fact generator. Use ONLY the evidence below.
 
 Return exactly these sections:
 BIG PICTURE:
@@ -202,8 +202,10 @@ PERSONAL FOCUS:
 
 Rules:
 - Do not invent facts or citations.
+- Every factual statement must be traceable to the evidence pack or source excerpts.
+- If evidence is missing, write "Not stated in the provided material." instead of guessing.
 - Keep formulas, names, definitions, and relationships faithful to the evidence.
-- Merge repeated ideas.
+- Merge repeated ideas without changing meaning.
 - Prefer clear explanations over sentence copying.
 - Personal Focus should prioritize weak concepts from the learner profile but still use only supported material.
 
@@ -224,21 +226,23 @@ ${source.slice(0, 9500)}`;
 
 async function runAsk(msg) {
   const source = String(msg.source || "").slice(0, 18000);
-  const text = await generate([
-    {
-      role: "system",
-      content:
-        "You are an expert family study tutor — clear and structured like a great teacher. " +
-        "Strong on English/essays, math, science, electronics circuit symbols, components, Ohm's law, and logic gates. " +
-        "When STUDY MATERIAL is provided, answer from it first. For component sheets, reply as: **Name** then function in 1–3 clean sentences. " +
-        "If material is thin, teach accurate foundational knowledge. Be encouraging and precise. Never invent page numbers."
-    },
-    {
-      role: "user",
-      content: `STUDENT QUESTION:\n${msg.question}\n\nSTUDY MATERIAL (may be empty or partial):\n${source || "(none loaded — use general curriculum knowledge)"}`
-    }
-  ], { max_new_tokens: 280 }, msg.requestId);
-  // Grounding is softer when source is empty — still return a score for UI
+  const history = Array.isArray(msg.history) ? msg.history.slice(-8) : [];
+  const messages = [{ role: "system", content:
+    "You are StudyVault's study tutor for a student who needs accurate, exam-ready answers. " +
+    "Structure every answer like this when possible:\n" +
+    "1) Direct answer in 1–3 short sentences\n" +
+    "2) From your material: quote or closely paraphrase only what the STUDY MATERIAL supports\n" +
+    "3) Tip: one practical next step (e.g. restate in own words, check page, practice a similar question)\n" +
+    "Rules: STUDY MATERIAL is the only authority for class-specific facts. Never invent definitions, formulas, numbers, names, or page references. " +
+    "If the material does not contain the answer, say so clearly and give only general foundation if helpful. " +
+    "Do not answer with exam question text. Prefer short paragraphs over long walls of text. Accuracy beats completeness." }];
+  for (const h of history) {
+    if (!h || !h.text) continue;
+    messages.push({ role: h.role === "tutor" ? "assistant" : "user", content: String(h.text).slice(0, 1400) });
+  }
+  messages.push({ role: "user", content:
+    `STUDENT QUESTION:\n${msg.question}\n\nSTUDY MATERIAL:\n${source || "(none loaded)"}\n\nANSWER RULE: Prefer short, structured answers. Separate verified material from anything not in the source.` });
+  const text = await generate(messages, { max_new_tokens: deviceProfile().android ? 220 : 300 }, msg.requestId);
   const score = source.trim() ? groundingScore(text, source, msg.terms || []) : 70;
   return { text, score };
 }

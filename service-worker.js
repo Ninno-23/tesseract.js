@@ -1,4 +1,4 @@
-const CACHE_NAME = "studyvault-v27-shell";
+const CACHE_NAME = "studyvault-v37-shell-summary-pics";
 const SHELL = [
   "./",
   "./index.html",
@@ -12,7 +12,7 @@ const SHELL = [
   "./vendor/pdfjs/pdf.worker.min.js",
   "./vendor/tesseract/tesseract.min.js"
 ];
-const REMOTE_CACHE = "studyvault-v27-runtime";
+const REMOTE_CACHE = "studyvault-v29-runtime";
 const ALLOWED_REMOTE = [
   "cdnjs.cloudflare.com",
   "cdn.jsdelivr.net",
