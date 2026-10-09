@@ -1,0 +1,25 @@
+name: Carrot AI checks
+on:
+  push:
+  pull_request:
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: python -m py_compile app.py
+      - name: Backend smoke tests
+        run: |
+          python - <<'PY'
+          import app
+          client = app.app.test_client()
+          r = client.get('/api/health')
+          assert r.status_code == 200 and r.json['ok']
+          r = client.get('/')
+          assert r.status_code == 200
+          print('Backend smoke tests passed')
+          PY
